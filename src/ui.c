@@ -113,16 +113,56 @@ static void Gradient(SDL_Renderer *r, int w, int h) {
     SDL_RenderGeometry(r, NULL, v, 4, idx, 6);
 }
 
-static void Circle(SDL_Renderer *r, float cx, float cy, float rad, SDL_FColor c) {
-    enum { N = 40 };
-    SDL_Vertex v[N * 3];
-    for (int i = 0; i < N; i++) {
-        float a0 = (float) (2 * SDL_PI_D * i / N), a1 = (float) (2 * SDL_PI_D * (i + 1) / N);
-        v[i * 3] = (SDL_Vertex) {{cx, cy}, c, {0, 0}};
-        v[i * 3 + 1] = (SDL_Vertex) {{cx + rad * SDL_cosf(a0), cy + rad * SDL_sinf(a0)}, c, {0, 0}};
-        v[i * 3 + 2] = (SDL_Vertex) {{cx + rad * SDL_cosf(a1), cy + rad * SDL_sinf(a1)}, c, {0, 0}};
+/* SDL_RenderGeometry has no antialiasing, so a triangle-fan circle shows its
+ * polygon and a hard staircase edge. Every round shape in the UI (icons, play
+ * button, the logo's bar caps) routes through Circle(), so fix it here once:
+ * rasterise a white disc with a feathered alpha edge at the exact on-screen
+ * size, cached per radius. Scaling a single big disc down instead would
+ * re-alias — linear filtering only samples 2x2 texels. */
+static SDL_Texture *DiscTexture(SDL_Renderer *r, int rad) {
+    enum { CACHE = 16 };
+    static struct { int rad; SDL_Texture *tex; } cache[CACHE]; /* freed with the renderer */
+    static int next;
+    for (int i = 0; i < CACHE; i++) {
+        if (cache[i].tex && cache[i].rad == rad) return cache[i].tex;
     }
-    SDL_RenderGeometry(r, NULL, v, N * 3, NULL, 0);
+    const int D = rad * 2 + 2; /* 1px margin all round for the feather */
+    SDL_Surface *s = SDL_CreateSurface(D, D, SDL_PIXELFORMAT_RGBA32);
+    if (!s) return NULL;
+    const float c = D / 2.0f - 0.5f, R = (float) rad - 0.5f;
+    for (int y = 0; y < D; y++) {
+        Uint8 *row = (Uint8 *) s->pixels + (size_t) y * s->pitch;
+        for (int x = 0; x < D; x++) {
+            float d = SDL_sqrtf((x - c) * (x - c) + (y - c) * (y - c));
+            float a = R - d + 1.0f; /* 1px feather */
+            a = a < 0 ? 0 : a > 1 ? 1 : a;
+            Uint8 *px = row + x * 4;
+            px[0] = px[1] = px[2] = 255;
+            px[3] = (Uint8) (a * 255.0f);
+        }
+    }
+    SDL_Texture *tex = SDL_CreateTextureFromSurface(r, s);
+    SDL_DestroySurface(s);
+    if (!tex) return NULL;
+    SDL_SetTextureScaleMode(tex, SDL_SCALEMODE_LINEAR);
+    /* A handful of radii exist per resolution; round-robin is eviction enough. */
+    if (cache[next].tex) SDL_DestroyTexture(cache[next].tex);
+    cache[next].rad = rad;
+    cache[next].tex = tex;
+    next = (next + 1) % CACHE;
+    return tex;
+}
+
+static void Circle(SDL_Renderer *r, float cx, float cy, float rad, SDL_FColor c) {
+    int irad = (int) (rad + 0.5f);
+    if (irad < 1) return;
+    SDL_Texture *disc = DiscTexture(r, irad);
+    if (!disc) return;
+    SDL_SetTextureColorMod(disc, (Uint8) (c.r * 255), (Uint8) (c.g * 255), (Uint8) (c.b * 255));
+    SDL_SetTextureAlphaMod(disc, (Uint8) (c.a * 255));
+    float D = (float) (irad * 2 + 2);
+    SDL_FRect dst = {cx - D / 2, cy - D / 2, D, D};
+    SDL_RenderTexture(r, disc, NULL, &dst);
 }
 
 /* The Plume mark ("Aile"): stream bars stacked into a wing, tip in ice.
