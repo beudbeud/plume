@@ -239,7 +239,12 @@ static void LoadSettings(void) {
     char path[512];
     DataPath(path, sizeof(path), "settings.conf");
     FILE *f = fopen(path, "r");
-    if (!f) return;
+    if (!f) {
+        /* Silently running on defaults after the user picked 480p in the menu is
+         * the kind of thing you chase for an hour. $HOME decides where this lives. */
+        fprintf(stderr, "settings: %s absent, using defaults\n", path);
+        return;
+    }
     char key[64];
     int value;
     while (fscanf(f, "%63s %d", key, &value) == 2) {
@@ -260,6 +265,8 @@ static void LoadSettings(void) {
     if (g_fps <= 0) g_fps = 60;
     if (g_kbps <= 0) g_kbps = 15000;
     if (g_scale < MEDIA_SCALE_FIT || g_scale > MEDIA_SCALE_CROP) g_scale = MEDIA_SCALE_FIT;
+    fprintf(stderr, "settings: %s -> %dx%d @ %d fps, %d kbps, scaling %d, hevc %d, audio %d, desktop %d\n",
+            path, g_width, g_height, g_fps, g_kbps, g_scale, g_hevc, g_audio, g_desktop);
 }
 
 static void SaveSettings(void) {
