@@ -1,0 +1,4 @@
+[submodule "external/IHSlib"]
+	path = external/IHSlib
+	url = https://github.com/beudbeud/ihslib.git
+	branch = plume

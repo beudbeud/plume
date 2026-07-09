@@ -22,15 +22,19 @@ sudo apt install cmake pkg-config build-essential \
   libswresample-dev libprotobuf-c-dev libmbedtls-dev
 ```
 
-IHSlib is vendored at `external/IHSlib` (patched — see below). CMake falls back
-to fetching upstream only if the vendored copy is missing.
-
 ## Build
 
 ```sh
+git clone --recursive https://github.com/beudbeud/plume.git
 cmake -B build -DCMAKE_BUILD_TYPE=Release
 cmake --build build -j
 ```
+
+`--recursive` is not optional. IHSlib lives at `external/IHSlib` as a submodule
+of [our fork](https://github.com/beudbeud/ihslib/tree/plume), which carries the
+patches listed below. Without it that directory is empty, and CMake silently
+falls back to fetching *upstream* IHSlib — which builds, and then misbehaves.
+An existing clone catches up with `git submodule update --init`.
 
 Build natively on each architecture (or cross-compile with an aarch64 toolchain).
 
@@ -90,9 +94,10 @@ host's own HEVC toggle say. It costs nothing to leave on — the Pi5 has no H264
 hardware decoder anyway, and software H264 decodes 1080p60 in **0.2–0.3 ms/frame**,
 roughly 50× headroom. HEVC would be a nice-to-have, not a need.
 
-## Patches to vendored IHSlib
+## Patches to IHSlib
 
-Non-obvious fixes that must survive a rebase onto upstream:
+Non-obvious fixes, one commit each on the fork's `plume` branch, that must
+survive a rebase onto upstream:
 
 - **`session/window.c`** — `Poll` skips orphan fragments at the window head
   (joining a stream in progress lands mid-message, and the window used to wedge
