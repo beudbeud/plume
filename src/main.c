@@ -399,6 +399,12 @@ static int DoStream(const IHS_HostInfo *host, bool audio) {
                 (e.type == SDL_EVENT_KEY_DOWN && e.key.key == SDLK_ESCAPE)) {
                 if (!disconnecting) { IHS_SessionDisconnect(session); disconnecting = true; }
             } else if (!disconnecting) {
+                /* Mid-stream (dis)appearance is the signature of a controller or USB
+                 * hiccup — the one thing a "controls went dead" report can't show. */
+                if (e.type == SDL_EVENT_GAMEPAD_REMOVED || e.type == SDL_EVENT_GAMEPAD_ADDED)
+                    SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION, "gamepad %s mid-stream (id=%d)",
+                                e.type == SDL_EVENT_GAMEPAD_REMOVED ? "removed" : "added",
+                                (int) e.gdevice.which);
                 padButton |= e.type == SDL_EVENT_GAMEPAD_BUTTON_DOWN;
                 hidDirty |= ForwardInput(session, &e);
             }
