@@ -85,29 +85,45 @@ static int VideoStart(IHS_Session *session, const IHS_StreamVideoConfig *config,
     (void) session; (void) context;
     bool hevc = config->codec == IHS_StreamVideoCodecHEVC;
     enum AVCodecID id = hevc ? AV_CODEC_ID_HEVC : AV_CODEC_ID_H264;
-    const AVCodec *codec = avcodec_find_decoder(id);
-    if (!codec) { SDL_Log("no decoder for codec %d", config->codec); return -1; }
+    const AVCodec *sw = avcodec_find_decoder(id);
+    if (!sw) { SDL_Log("no decoder for codec %d", config->codec); return -1; }
 
-    /* Discover a hardware-decode config. Only for HEVC: the Pi5's only video
-     * hardware decoder is HEVC (V4L2-request/DRM); it has no H264 block, so H264
-     * always uses the software decoder. */
+    /* Two shapes of hardware decode, and the Pi generations disagree on which:
+     *
+     *  - hwaccel bound to a device context, discovered from the codec. That's the
+     *    Pi5's HEVC block (V4L2-request/DRM). It has no H264 block at all.
+     *  - a whole standalone decoder, only findable by name. That's the VideoCore
+     *    H264 block of the Pi3/Pi4, exposed as `h264_v4l2m2m`.
+     *
+     * Neither exists on a PC, where avcodec_find_decoder_by_name returns NULL and
+     * the hwaccel loop finds nothing, so we fall through to software. */
+    const AVCodec *hwCodec = NULL;
     enum AVHWDeviceType hwType = AV_HWDEVICE_TYPE_NONE;
     hwPixFmt = AV_PIX_FMT_NONE;
     if (hevc) {
         for (int i = 0;; i++) {
-            const AVCodecHWConfig *hw = avcodec_get_hw_config(codec, i);
+            const AVCodecHWConfig *hw = avcodec_get_hw_config(sw, i);
             if (!hw) break;
             if (hw->methods & AV_CODEC_HW_CONFIG_METHOD_HW_DEVICE_CTX) {
+                hwCodec = sw;
                 hwType = hw->device_type;
                 hwPixFmt = hw->pix_fmt;
                 break;
             }
         }
+    } else {
+        hwCodec = avcodec_find_decoder_by_name("h264_v4l2m2m");
     }
+    /* A V4L2 decoder that opens and then decodes badly can't be told apart from a
+     * good one at open time. Escape hatch, since the fallback is known to work. */
+    if (SDL_getenv("PLUME_NO_HWDEC")) hwCodec = NULL;
 
-    /* Attempt 0: hardware (if available). Attempt 1: software fallback. */
+    /* Attempt 0: hardware (if available). Attempt 1: software fallback. Opening
+     * the V4L2 decoder fails on a Pi5 (no H264 device node) and on any kernel
+     * without the driver, so the fallback is the load-bearing path, not a nicety. */
     for (int attempt = 0; attempt < 2; attempt++) {
-        bool useHw = attempt == 0 && hwType != AV_HWDEVICE_TYPE_NONE;
+        bool useHw = attempt == 0 && hwCodec != NULL;
+        const AVCodec *codec = useHw ? hwCodec : sw;
         vctx = avcodec_alloc_context3(codec);
         vctx->thread_count = 0; /* auto: one thread per core */
         if (useHw) {
@@ -120,13 +136,13 @@ static int VideoStart(IHS_Session *session, const IHS_StreamVideoConfig *config,
              * single core. Trade ~thread_count frames of latency for keeping up. */
             vctx->thread_type = FF_THREAD_FRAME | FF_THREAD_SLICE;
         }
-        if (useHw && av_hwdevice_ctx_create(&hwDeviceCtx, hwType, NULL, NULL, 0) == 0) {
+        if (useHw && hwType != AV_HWDEVICE_TYPE_NONE &&
+            av_hwdevice_ctx_create(&hwDeviceCtx, hwType, NULL, NULL, 0) == 0) {
             vctx->hw_device_ctx = av_buffer_ref(hwDeviceCtx);
             vctx->get_format = GetHwFormat;
         }
         if (avcodec_open2(vctx, codec, NULL) == 0) {
-            SDL_Log("video decoder: %s (%s)", codec->name,
-                    vctx->hw_device_ctx ? av_hwdevice_get_type_name(hwType) : "software");
+            SDL_Log("video decoder: %s (%s)", codec->name, useHw ? "hardware" : "software");
             return 0;
         }
         avcodec_free_context(&vctx);
@@ -200,7 +216,10 @@ static IHS_StreamVideoSubmitResult VideoSubmit(IHS_Session *session, uint16_t fr
                 dl = av_frame_alloc();
                 if (av_hwframe_transfer_data(dl, f, 0) == 0) sw = dl;
             }
-            /* Steam decode is yuv420p; NV12 (HW) and anything else go via swscale. */
+            /* Steam decode is yuv420p; NV12 (HW) and anything else go via swscale.
+             * ponytail: h264_v4l2m2m hands back NV12, so every Pi3/Pi4 frame pays a
+             * chroma de-interleave here. Upload it straight with SDL_UpdateNVTexture
+             * (SDL_PIXELFORMAT_NV12) if it shows up in the decode average. */
             if (sw->format == AV_PIX_FMT_YUV420P) {
                 StashFrame(sw, frameId);
             } else {

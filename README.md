@@ -8,7 +8,7 @@ mouse and gamepads back to the host. The launcher is built for a controller:
 D-pad or stick navigation, resolution and scaling settings in a menu, and
 Hotkey + Start to leave a running stream. About 1500 lines on top of
 [IHSlib](https://github.com/mariotaku/IHSlib), no exotic dependencies, and it
-holds 1080p60 on a Raspberry Pi 5 with 50× headroom on decode.
+holds 1080p60 on a Raspberry Pi 5.
 
 Runs on Linux **amd64** and **arm64** — nothing is arch-specific; FFmpeg picks
 threaded/hardware decode paths per platform. Packaged for Recalbox on the
@@ -85,14 +85,29 @@ Device identity lives next door in `creds.bin`, so pairing survives restarts. A
 pre-rename `~/.local/share/steamlink-ihs/` is adopted on first run, so no one has
 to re-enter a PIN.
 
-## HEVC
+## Hardware decode
 
-The hardware path is wired (FFmpeg hwaccel via V4L2-request/DRM on the Pi5) but
-unreachable in practice: the Steam hosts tested only ever advertise codec 4
-(H264) and 1 (Raw) during negotiation, whatever `--hevc`, `device_version` or the
-host's own HEVC toggle say. It costs nothing to leave on — the Pi5 has no H264
-hardware decoder anyway, and software H264 decodes 1080p60 in **0.2–0.3 ms/frame**,
-roughly 50× headroom. HEVC would be a nice-to-have, not a need.
+Tried first, software second; the fallback is the load-bearing path, so nothing
+here needs configuring. The Pi generations disagree on the shape of it:
+
+| | H264 | HEVC |
+|---|---|---|
+| **Pi 3 / Pi 4** | `h264_v4l2m2m` (VideoCore) | — |
+| **Pi 5** | none — software | V4L2-request/DRM hwaccel |
+| **PC** | software | software |
+
+The Pi5 lost the H264 block its predecessors have, and its HEVC block never gets
+used: the Steam hosts tested only ever advertise codec 4 (H264) and 1 (Raw) at
+negotiation, whatever `--hevc`, `device_version` or the host's own HEVC toggle
+say. Software H264 keeps 1080p60 there comfortably.
+
+The Pi3 and Pi4 need their hardware decoder. Software H264 on a Cortex-A53 will
+not hold 1080p60, and the Pi3's VideoCore caps H264 at 1080p30 — expect 720p on
+that board.
+
+The `decode: N ms/frame` log line is *not* the cost of decoding a frame. With
+frame threading, `avcodec_send_packet` returns before the work is done, so it
+measures the serialized part only; the real work is spread across cores.
 
 ## Patches to IHSlib
 
