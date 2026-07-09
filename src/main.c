@@ -29,7 +29,6 @@
 /* Shared SDL objects, created once and lent to the menu and the decoder. */
 static SDL_Window *g_window;
 static SDL_Renderer *g_renderer;
-static TTF_Font *g_font, *g_titleFont;
 
 /* -------- persistent device identity (so pairing survives restarts) -------- */
 static uint64_t g_deviceId;
@@ -362,7 +361,7 @@ static int DoStream(const IHS_HostInfo *host, bool audio) {
     if (!RequestStream(host, &sinfo, &res)) {
         /* Not paired yet -> pair from the UI, then retry once. */
         if (res != IHS_StreamingUnauthorized) return 1;
-        if (!PairScreen(g_renderer, g_font, g_titleFont, &g_config, host)) return 1;
+        if (!PairScreen(g_renderer, &g_config, host)) return 1;
         if (!RequestStream(host, &sinfo, &res)) return 1;
     }
 
@@ -429,24 +428,6 @@ static int DoStream(const IHS_HostInfo *host, bool audio) {
     return 0;
 }
 
-/* Find a usable TTF: env override, then common system/Recalbox locations. */
-static TTF_Font *LoadFont(float pt) {
-    const char *paths[] = {
-            SDL_getenv("PLUME_FONT"),
-            "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
-            "/usr/share/fonts/dejavu/DejaVuSans.ttf",
-            "/usr/share/fonts/TTF/DejaVuSans.ttf",
-            "/recalbox/share_init/system/.emulationstation/fonts/OpenSans_Regular.ttf",
-    };
-    for (size_t i = 0; i < SDL_arraysize(paths); i++) {
-        if (paths[i] && paths[i][0]) {
-            TTF_Font *f = TTF_OpenFont(paths[i], pt);
-            if (f) return f;
-        }
-    }
-    return NULL;
-}
-
 /* -------------------------------- main ------------------------------------ */
 int main(int argc, char *argv[]) {
     bool pair = false;
@@ -502,13 +483,7 @@ int main(int argc, char *argv[]) {
     }
     SDL_SetRenderVSync(g_renderer, 1);
 
-    /* Size fonts from the real output height so the UI fits 240p/480p up to 1080p+. */
-    int ow, oh;
-    SDL_GetRenderOutputSize(g_renderer, &ow, &oh);
-    if (oh <= 0) oh = 720;
-    g_font = LoadFont(oh / 24.0f);
-    g_titleFont = LoadFont(oh / 13.0f);
-    if (!g_font || !g_titleFont) {
+    if (!UIEnsureFonts(g_renderer)) {
         fprintf(stderr, "Font unavailable (set PLUME_FONT to a .ttf)\n");
         IHS_Quit();
         return 1;
@@ -517,7 +492,7 @@ int main(int argc, char *argv[]) {
     for (;;) {
         UIResult r = {.hevc = g_hevc, .audio = g_audio, .desktop = g_desktop, .scale = g_scale,
                       .width = g_width, .height = g_height, .fps = g_fps, .kbps = g_kbps};
-        UIAction act = RunMenu(g_window, g_renderer, g_font, g_titleFont, &g_config, &r);
+        UIAction act = RunMenu(g_window, g_renderer, &g_config, &r);
         g_hevc = r.hevc; g_audio = r.audio; g_desktop = r.desktop; g_scale = r.scale;
         g_width = r.width; g_height = r.height; g_fps = r.fps; g_kbps = r.kbps;
         SaveSettings();
@@ -525,8 +500,7 @@ int main(int argc, char *argv[]) {
         DoStream(&r.host, r.audio);
     }
 
-    TTF_CloseFont(g_font);
-    TTF_CloseFont(g_titleFont);
+    UICloseFonts();
     SDL_DestroyRenderer(g_renderer);
     SDL_DestroyWindow(g_window);
     TTF_Quit();

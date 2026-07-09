@@ -1,4 +1,4 @@
-# Plume
+# <img src="assets/logo.svg" height="56" align="center" alt=""> Plume
 
 A lightweight Steam Remote Play client in C, with SDL3 and FFmpeg.
 

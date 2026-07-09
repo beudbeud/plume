@@ -1,0 +1,16 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 128 128">
+  <!-- Plume: three rising wisps of steam, the centre one ending in a quill tip.
+       Colours are the launcher's palette. ui.c draws the same geometry live. -->
+  <defs>
+    <linearGradient id="tile" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#0a1226"/>
+      <stop offset="1" stop-color="#15477f"/>
+    </linearGradient>
+  </defs>
+  <rect width="128" height="128" rx="24" fill="url(#tile)"/>
+  <g fill="none" stroke-linecap="round" transform="translate(64 64) scale(0.78) translate(-64 -64)">
+    <path d="M 44 100 C 34 86, 52 76, 43 60" stroke="#3caaf5" stroke-width="10"/>
+    <path d="M 86 100 C 94 86, 74 76, 84 60" stroke="#3caaf5" stroke-width="10"/>
+    <path d="M 64 108 C 48 88, 82 72, 66 48 C 58 36, 63 26, 76 18" stroke="#f2f7fc" stroke-width="10"/>
+  </g>
+</svg>

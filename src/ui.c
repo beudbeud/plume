@@ -39,6 +39,52 @@ static const struct { const char *label; int w, h, fps, kbps; } RES[] = {
 static const char *SCALE_NAMES[] = {"Fit", "Stretch", "Crop"};
 #define SCALE_N ((int) SDL_arraysize(SCALE_NAMES))
 
+/* ---- fonts, sized from the live output mode ---- */
+static TTF_Font *uiFont, *uiTitleFont;
+static int uiFontH;
+
+/* Find a usable TTF: env override, then common system/Recalbox locations. */
+static TTF_Font *LoadFont(float pt) {
+    const char *paths[] = {
+            SDL_getenv("PLUME_FONT"),
+            "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+            "/usr/share/fonts/dejavu/DejaVuSans.ttf",
+            "/usr/share/fonts/TTF/DejaVuSans.ttf",
+            "/recalbox/share_init/system/.emulationstation/fonts/OpenSans_Regular.ttf",
+    };
+    for (size_t i = 0; i < SDL_arraysize(paths); i++) {
+        if (paths[i] && paths[i][0]) {
+            TTF_Font *f = TTF_OpenFont(paths[i], pt);
+            if (f) return f;
+        }
+    }
+    return NULL;
+}
+
+bool UIEnsureFonts(SDL_Renderer *renderer) {
+    int ow, oh;
+    SDL_GetRenderOutputSize(renderer, &ow, &oh);
+    (void) ow;
+    if (oh <= 0) oh = 720;
+    if (uiFont && uiTitleFont && oh == uiFontH) return true;
+    /* An HDMI mode switch can land after startup: the window opens in one mode
+     * and fullscreen settles in another. Layout rects follow the real output
+     * every frame; fonts must too, or glyphs overflow their rows and centred
+     * text walks off screen. */
+    UICloseFonts();
+    uiFont = LoadFont(oh / 24.0f);
+    uiTitleFont = LoadFont(oh / 13.0f);
+    uiFontH = oh;
+    return uiFont && uiTitleFont;
+}
+
+void UICloseFonts(void) {
+    if (uiFont) TTF_CloseFont(uiFont);
+    if (uiTitleFont) TTF_CloseFont(uiTitleFont);
+    uiFont = uiTitleFont = NULL;
+    uiFontH = 0;
+}
+
 /* ---- draw helpers ---- */
 static void FillRect(SDL_Renderer *r, float x, float y, float w, float h,
                      Uint8 cr, Uint8 cg, Uint8 cb, Uint8 ca) {
@@ -75,6 +121,33 @@ static void Circle(SDL_Renderer *r, float cx, float cy, float rad, SDL_FColor c)
         v[i * 3 + 2] = (SDL_Vertex) {{cx + rad * SDL_cosf(a1), cy + rad * SDL_sinf(a1)}, c, {0, 0}};
     }
     SDL_RenderGeometry(r, NULL, v, N * 3, NULL, 0);
+}
+
+/* The Plume mark: three rising wisps of steam, the centre one ending in a quill
+ * tip. SDL has no path stroking, so each cubic is stamped as overlapping dots.
+ * Geometry matches assets/logo.svg (authored on a 128 grid). */
+static void BezierStroke(SDL_Renderer *r, const float p[8], float sc, float ox, float oy,
+                         float rad, SDL_FColor c) {
+    enum { N = 22 };
+    for (int i = 0; i <= N; i++) {
+        float t = (float) i / N, u = 1 - t;
+        float x = u * u * u * p[0] + 3 * u * u * t * p[2] + 3 * u * t * t * p[4] + t * t * t * p[6];
+        float y = u * u * u * p[1] + 3 * u * u * t * p[3] + 3 * u * t * t * p[5] + t * t * t * p[7];
+        Circle(r, ox + x * sc, oy + y * sc, rad, c);
+    }
+}
+
+static void Logo(SDL_Renderer *r, float x, float y, float h) {
+    static const float left[8] = {44, 100, 34, 86, 52, 76, 43, 60};
+    static const float right[8] = {86, 100, 94, 86, 74, 76, 84, 60};
+    static const float mid1[8] = {64, 108, 48, 88, 82, 72, 66, 48};
+    static const float mid2[8] = {66, 48, 58, 36, 63, 26, 76, 18};
+    const SDL_FColor accent = {0.24f, 0.67f, 0.96f, 1}, ice = {0.95f, 0.97f, 0.99f, 1};
+    float sc = h / 128.0f, rad = 5.0f * sc;
+    BezierStroke(r, left, sc, x, y, rad, accent);
+    BezierStroke(r, right, sc, x, y, rad, accent);
+    BezierStroke(r, mid1, sc, x, y, rad, ice);
+    BezierStroke(r, mid2, sc, x, y, rad, ice);
 }
 
 /* Render text; returns width. Anchors top-left unless centered in [x,x+boxW]. */
@@ -150,9 +223,8 @@ static bool NavPoll(NavState *s, SDL_Gamepad *pad, int *dx, int *dy) {
 /* ---- settings screen ---- */
 /* Modal over the launcher. Up/Down picks a row, Left/Right or A changes it,
  * B/Escape returns. Edits the settings in place. */
-static void SettingsScreen(SDL_Renderer *renderer, TTF_Font *font, TTF_Font *titleFont,
-                           SDL_Gamepad *pad, int *resIdx, bool *hevc, bool *audio, bool *desktop,
-                           int *scale) {
+static void SettingsScreen(SDL_Renderer *renderer, SDL_Gamepad *pad, int *resIdx,
+                           bool *hevc, bool *audio, bool *desktop, int *scale) {
     enum { ROW_RES, ROW_SCALING, ROW_DESKTOP, ROW_HEVC, ROW_AUDIO, ROW_BACK, ROW_N };
     static const char *labels[ROW_N] = {"Resolution", "Scaling", "Desktop mode", "HEVC video", "Audio", "Back"};
     const SDL_Color white = {255, 255, 255, 255}, dim = {180, 195, 215, 255};
@@ -208,6 +280,8 @@ static void SettingsScreen(SDL_Renderer *renderer, TTF_Font *font, TTF_Font *tit
             if (delta != 0) APPLY(delta);
         }
 
+        UIEnsureFonts(renderer);
+        TTF_Font *font = uiFont, *titleFont = uiTitleFont;
         int W, H;
         SDL_GetRenderOutputSize(renderer, &W, &H);
         float pad_ = H * 0.035f;
@@ -291,8 +365,8 @@ static void POnFailed(IHS_Client *c, const IHS_HostInfo *h, IHS_AuthorizationRes
 }
 static void POnProgress(IHS_Client *c, const IHS_HostInfo *h, void *ctx) { (void) c; (void) h; (void) ctx; }
 
-bool PairScreen(SDL_Renderer *renderer, TTF_Font *font, TTF_Font *titleFont,
-                const IHS_ClientConfig *config, const IHS_HostInfo *host) {
+bool PairScreen(SDL_Renderer *renderer, const IHS_ClientConfig *config,
+                const IHS_HostInfo *host) {
     uint32_t rnd = 0;
     SDL_IOStream *io = SDL_IOFromFile("/dev/urandom", "rb");
     if (io) { SDL_ReadIO(io, &rnd, sizeof(rnd)); SDL_CloseIO(io); }
@@ -324,6 +398,8 @@ bool PairScreen(SDL_Renderer *renderer, TTF_Font *font, TTF_Font *titleFont,
                 (e.type == SDL_EVENT_GAMEPAD_BUTTON_DOWN && BtnIsBack(e.gbutton.which, e.gbutton.button)))
                 cancelled = true;
         }
+        UIEnsureFonts(renderer);
+        TTF_Font *font = uiFont, *titleFont = uiTitleFont;
         int W, H;
         SDL_GetRenderOutputSize(renderer, &W, &H);
         Gradient(renderer, W, H);
@@ -343,8 +419,8 @@ bool PairScreen(SDL_Renderer *renderer, TTF_Font *font, TTF_Font *titleFont,
 }
 
 /* ---- menu ---- */
-UIAction RunMenu(SDL_Window *window, SDL_Renderer *renderer, TTF_Font *font,
-                 TTF_Font *titleFont, const IHS_ClientConfig *config, UIResult *out) {
+UIAction RunMenu(SDL_Window *window, SDL_Renderer *renderer,
+                 const IHS_ClientConfig *config, UIResult *out) {
     hostLock = SDL_CreateMutex();
     hostCount = 0;
 
@@ -394,6 +470,8 @@ UIAction RunMenu(SDL_Window *window, SDL_Renderer *renderer, TTF_Font *font,
         n = hostCount;
         SDL_UnlockMutex(hostLock);
         /* --- layout (before input, so the icons can be hit-tested) --- */
+        UIEnsureFonts(renderer);
+        TTF_Font *font = uiFont;
         int W, H;
         SDL_GetRenderOutputSize(renderer, &W, &H);
         float pad_ = H * 0.035f;
@@ -447,7 +525,7 @@ UIAction RunMenu(SDL_Window *window, SDL_Renderer *renderer, TTF_Font *font,
             activate:
             if (focus == FOCUS_QUIT) { action = UI_QUIT; running = false; break; }
             if (focus == FOCUS_SETTINGS) {
-                SettingsScreen(renderer, font, titleFont, pad, &resIdx, &hevc, &audio, &desktop, &scale);
+                SettingsScreen(renderer, pad, &resIdx, &hevc, &audio, &desktop, &scale);
                 nav = (NavState) {0}; /* the stick may still be held; don't carry it back */
                 break;
             }
@@ -460,7 +538,9 @@ UIAction RunMenu(SDL_Window *window, SDL_Renderer *renderer, TTF_Font *font,
 
         /* --- render --- */
         Gradient(renderer, W, H);
-        Text(renderer, titleFont, "Plume", pad_, pad_ * 0.6f, white, 0);
+        /* The mark ink spans y 16..108 of its 128 grid, so the box overshoots a
+         * touch; sized to sit where the old wordmark title did. */
+        Logo(renderer, pad_ * 0.6f, pad_ * 0.2f, H * 0.16f);
 
         /* top-right circular buttons: settings (accent), help, quit */
         if (focus == FOCUS_SETTINGS) Circle(renderer, cx, icy, br * 1.22f, (SDL_FColor) {0.24f, 0.67f, 0.96f, 1});

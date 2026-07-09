@@ -20,12 +20,18 @@ typedef struct {
     int kbps;            /* settings: cap on the host's bitrate, scaled to resolution */
 } UIResult;
 
+/* Fonts are owned by the UI, sized from the real render output, and re-sized if
+ * the output mode changes. Call once after renderer creation; screens call it
+ * every frame. Returns false when no usable TTF exists. */
+bool UIEnsureFonts(SDL_Renderer *renderer);
+void UICloseFonts(void);
+
 /* Runs the launcher. Uses the shared client config for LAN discovery.
  * Returns UI_START (out->host filled) or UI_QUIT. */
-UIAction RunMenu(SDL_Window *window, SDL_Renderer *renderer, TTF_Font *font,
-                 TTF_Font *titleFont, const IHS_ClientConfig *config, UIResult *out);
+UIAction RunMenu(SDL_Window *window, SDL_Renderer *renderer,
+                 const IHS_ClientConfig *config, UIResult *out);
 
 /* Full-screen pairing prompt: shows a PIN to type into Steam on the host and
  * waits for approval. Returns true once paired, false on cancel/failure. */
-bool PairScreen(SDL_Renderer *renderer, TTF_Font *font, TTF_Font *titleFont,
-                const IHS_ClientConfig *config, const IHS_HostInfo *host);
+bool PairScreen(SDL_Renderer *renderer, const IHS_ClientConfig *config,
+                const IHS_HostInfo *host);
