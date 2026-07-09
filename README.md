@@ -81,6 +81,9 @@ The same values are overridable per-run on the command line, which wins over the
 saved file: `--no-audio`, `--no-desktop`, `--hevc`, `--host <ip>` (only with
 `--pair`).
 
+By default only problems are printed. `--verbose` adds the IHSlib protocol trace
+and the decoder's chatter.
+
 Device identity lives next door in `creds.bin`, so pairing survives restarts. A
 pre-rename `~/.local/share/steamlink-ihs/` is adopted on first run, so no one has
 to re-enter a PIN.

@@ -77,7 +77,7 @@ static enum AVPixelFormat GetHwFormat(AVCodecContext *ctx, const enum AVPixelFor
     for (const enum AVPixelFormat *p = fmts; *p != AV_PIX_FMT_NONE; p++) {
         if (*p == hwPixFmt) return *p;
     }
-    SDL_Log("hw pixel format unavailable, falling back to software output");
+    SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION, "hw pixel format unavailable, falling back to software output");
     return fmts[0];
 }
 
@@ -86,7 +86,7 @@ static int VideoStart(IHS_Session *session, const IHS_StreamVideoConfig *config,
     bool hevc = config->codec == IHS_StreamVideoCodecHEVC;
     enum AVCodecID id = hevc ? AV_CODEC_ID_HEVC : AV_CODEC_ID_H264;
     const AVCodec *sw = avcodec_find_decoder(id);
-    if (!sw) { SDL_Log("no decoder for codec %d", config->codec); return -1; }
+    if (!sw) { SDL_LogError(SDL_LOG_CATEGORY_APPLICATION, "no decoder for codec %d", config->codec); return -1; }
 
     /* Two shapes of hardware decode, and the Pi generations disagree on which:
      *
@@ -154,7 +154,7 @@ static int VideoStart(IHS_Session *session, const IHS_StreamVideoConfig *config,
         avcodec_free_context(&vctx);
         if (hwDeviceCtx) av_buffer_unref(&hwDeviceCtx);
     }
-    SDL_Log("no usable decoder for codec %d", config->codec);
+    SDL_LogError(SDL_LOG_CATEGORY_APPLICATION, "no usable decoder for codec %d", config->codec);
     return -1;
 }
 
@@ -331,7 +331,7 @@ static int AudioStart(IHS_Session *session, const IHS_StreamAudioConfig *config,
     (void) session; (void) context;
     if (!audioEnabled) return 0;
     if (config->codec != IHS_StreamAudioCodecOpus) {
-        SDL_Log("unsupported audio codec %d, muting", config->codec);
+        SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION, "unsupported audio codec %d, muting", config->codec);
         audioEnabled = false;
         return 0;
     }

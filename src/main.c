@@ -4,6 +4,7 @@
  *   plume --pair          pair with a host (enter the shown PIN in Steam)
  *   plume --host <ip>     target a specific host instead of the first found
  *   plume --no-audio      video only
+ *   plume --verbose       show IHSlib/decoder chatter, not just problems
  *
  * Linux amd64 + arm64: nothing here is arch-specific; FFmpeg software decode
  * works on both, and picks hardware/threaded paths where available.
@@ -42,6 +43,7 @@ static int g_width = 1920, g_height = 1080, g_fps = 60, g_kbps = 15000; /* host 
 static bool g_audio = true;
 static bool g_desktop = true; /* stream the host's desktop, else its game session */
 static int g_scale = MEDIA_SCALE_FIT; /* fit / stretch / crop on aspect mismatch */
+static bool g_verbose = false; /* --verbose: everything; otherwise warnings and worse */
 
 static void DataPath(char *out, size_t n, const char *name) {
     const char *home = getenv("HOME");
@@ -85,6 +87,8 @@ static void LoadOrCreateCreds(void) {
 
 /* ----------------------------- logging ------------------------------------ */
 static void LogPrint(IHS_LogLevel level, const char *tag, const char *message) {
+    /* Fatal < Error < Warn < Info < Debug < Verbose: below Warn is chatter. */
+    if (!g_verbose && level > IHS_LogLevelWarn) return;
     fprintf(stderr, "[IHS.%s %s] %s\n", tag, IHS_LogLevelName(level), message);
 }
 
@@ -118,7 +122,7 @@ static void OnDiscovered(IHS_Client *client, const IHS_HostInfo *info, void *ctx
     }
     p->host = *info;
     p->found = true;
-    printf("Found host: %s\n", info->hostname);
+    if (g_verbose) printf("Found host: %s\n", info->hostname);
     IHS_ClientStop(client);
 }
 
@@ -242,7 +246,7 @@ static void LoadSettings(void) {
     if (!f) {
         /* Silently running on defaults after the user picked 480p in the menu is
          * the kind of thing you chase for an hour. $HOME decides where this lives. */
-        fprintf(stderr, "settings: %s absent, using defaults\n", path);
+        if (g_verbose) fprintf(stderr, "settings: %s absent, using defaults\n", path);
         return;
     }
     char key[64];
@@ -265,8 +269,9 @@ static void LoadSettings(void) {
     if (g_fps <= 0) g_fps = 60;
     if (g_kbps <= 0) g_kbps = 15000;
     if (g_scale < MEDIA_SCALE_FIT || g_scale > MEDIA_SCALE_CROP) g_scale = MEDIA_SCALE_FIT;
-    fprintf(stderr, "settings: %s -> %dx%d @ %d fps, %d kbps, scaling %d, hevc %d, audio %d, desktop %d\n",
-            path, g_width, g_height, g_fps, g_kbps, g_scale, g_hevc, g_audio, g_desktop);
+    if (g_verbose)
+        fprintf(stderr, "settings: %s -> %dx%d @ %d fps, %d kbps, scaling %d, hevc %d, audio %d, desktop %d\n",
+                path, g_width, g_height, g_fps, g_kbps, g_scale, g_hevc, g_audio, g_desktop);
 }
 
 static void SaveSettings(void) {
@@ -436,15 +441,19 @@ static TTF_Font *LoadFont(float pt) {
 int main(int argc, char *argv[]) {
     bool pair = false;
     const char *hostIp = NULL;
+    /* --verbose is read first: LoadSettings already logs. */
+    for (int i = 1; i < argc; i++) if (!strcmp(argv[i], "--verbose")) g_verbose = true;
+    SDL_SetLogPriorities(g_verbose ? SDL_LOG_PRIORITY_INFO : SDL_LOG_PRIORITY_WARN);
     LoadSettings(); /* before argv, so flags win over the saved file */
     for (int i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "--pair")) pair = true;
         else if (!strcmp(argv[i], "--no-audio")) g_audio = false;
         else if (!strcmp(argv[i], "--no-desktop")) g_desktop = false;
         else if (!strcmp(argv[i], "--hevc")) g_hevc = true;
+        else if (!strcmp(argv[i], "--verbose")) ; /* handled above */
         else if (!strcmp(argv[i], "--host") && i + 1 < argc) hostIp = argv[++i];
         else {
-            fprintf(stderr, "usage: %s [--pair] [--host <ip>] [--no-audio] [--no-desktop] [--hevc]\n", argv[0]);
+            fprintf(stderr, "usage: %s [--pair] [--host <ip>] [--no-audio] [--no-desktop] [--hevc] [--verbose]\n", argv[0]);
             return 2;
         }
     }
@@ -459,7 +468,7 @@ int main(int argc, char *argv[]) {
     /* --pair keeps the headless flow: discover one host, pair, exit. */
     if (pair) {
         IHS_HostInfo host;
-        printf("Discovering hosts%s...\n", hostIp ? " (filtered)" : "");
+        printf("Discovering hosts%s...\n", hostIp ? " (filtered)" : ""); /* --pair is interactive: always shown */
         int rc = 1;
         if (DiscoverHost(hostIp, 10, &host)) rc = DoPair(&host);
         else fprintf(stderr, "No host found. Is Steam running on the LAN with Remote Play enabled?\n");

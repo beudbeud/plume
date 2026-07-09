@@ -375,6 +375,7 @@ UIAction RunMenu(SDL_Window *window, SDL_Renderer *renderer, TTF_Font *font,
         /* Width too: 240p and 240p 4:3 share a height. */
         if (RES[i].w == out->width && RES[i].h == out->height) { resIdx = i; break; }
     }
+    const int resIdx0 = resIdx;
     bool hevc = out->hevc, audio = out->audio, desktop = out->desktop;
     int scale = out->scale;
 
@@ -531,10 +532,15 @@ UIAction RunMenu(SDL_Window *window, SDL_Renderer *renderer, TTF_Font *font,
     IHS_ClientDestroy(client);
     if (pad) SDL_CloseGamepad(pad);
 
-    out->width = RES[resIdx].w;
-    out->height = RES[resIdx].h;
-    out->fps = RES[resIdx].fps;
-    out->kbps = RES[resIdx].kbps;
+    /* Only the Resolution row owns these four. Writing them back unconditionally
+     * clobbered an fps or kbps hand-edited into settings.conf — and any resolution
+     * absent from RES, which the loop above resolves to 1080p. */
+    if (resIdx != resIdx0) {
+        out->width = RES[resIdx].w;
+        out->height = RES[resIdx].h;
+        out->fps = RES[resIdx].fps;
+        out->kbps = RES[resIdx].kbps;
+    }
     out->hevc = hevc;
     out->desktop = desktop;
     out->scale = scale;
