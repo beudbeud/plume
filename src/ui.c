@@ -171,11 +171,63 @@ static void Circle(SDL_Renderer *r, float cx, float cy, float rad, SDL_FColor c)
 /* The Plume mark ("Aile"): stream bars stacked into a wing, tip in ice.
  * Geometry matches assets/logo.svg (authored on a 128 grid). */
 static void Bar(SDL_Renderer *r, float x, float y, float w, float h, SDL_FColor c) {
+    /* Pin to the pixel grid so the caps and the body share the same rows. */
+    x = SDL_floorf(x + 0.5f);
+    y = SDL_floorf(y + 0.5f);
+    w = SDL_floorf(w + 0.5f);
+    h = SDL_floorf(h + 0.5f);
     Circle(r, x + h / 2, y + h / 2, h / 2, c);
     Circle(r, x + w - h / 2, y + h / 2, h / 2, c);
     SDL_SetRenderDrawColor(r, (Uint8) (c.r * 255), (Uint8) (c.g * 255), (Uint8) (c.b * 255), 255);
     SDL_FRect body = {x + h / 2, y, w - h, h};
     SDL_RenderFillRect(r, &body);
+}
+
+/* AA play triangle, rasterised at its exact on-screen size like the discs —
+ * the last SDL_RenderGeometry shape with diagonal (so visibly stairstepped)
+ * edges. Only one size exists per resolution, so a single slot caches it. */
+static void PlayTriangle(SDL_Renderer *r, float cx, float cy, float pr, SDL_FColor c) {
+    static SDL_Texture *tex; /* freed with the renderer */
+    static int texH;
+    int H = (int) (pr + 0.5f), W = (int) (pr * 0.9f + 0.5f);
+    if (H < 2 || W < 2) return;
+    if (!tex || texH != H) {
+        if (tex) { SDL_DestroyTexture(tex); tex = NULL; }
+        SDL_Surface *s = SDL_CreateSurface(W, H, SDL_PIXELFORMAT_RGBA32);
+        if (!s) return;
+        /* alpha = coverage from the signed distance to the closest edge */
+        const float ax = 0, ay = 0, bx = 0, by = (float) H, tx = (float) W, ty = H / 2.0f;
+        for (int y = 0; y < H; y++) {
+            Uint8 *row = (Uint8 *) s->pixels + (size_t) y * s->pitch;
+            for (int x = 0; x < W; x++) {
+                float px = x + 0.5f, py = y + 0.5f;
+                #define EDGE(x0, y0, x1, y1) \
+                    (((x1) - (x0)) * (py - (y0)) - ((y1) - (y0)) * (px - (x0))) / \
+                    SDL_sqrtf(((x1) - (x0)) * ((x1) - (x0)) + ((y1) - (y0)) * ((y1) - (y0)))
+                float d = EDGE(ax, ay, bx, by);
+                float d2 = EDGE(bx, by, tx, ty);
+                float d3 = EDGE(tx, ty, ax, ay);
+                #undef EDGE
+                if (d2 > d) d = d2;
+                if (d3 > d) d = d3; /* inside is negative; d = distance past the nearest edge */
+                float a = 0.5f - d;
+                a = a < 0 ? 0 : a > 1 ? 1 : a;
+                Uint8 *px8 = row + x * 4;
+                px8[0] = px8[1] = px8[2] = 255;
+                px8[3] = (Uint8) (a * 255.0f);
+            }
+        }
+        tex = SDL_CreateTextureFromSurface(r, s);
+        SDL_DestroySurface(s);
+        if (!tex) return;
+        SDL_SetTextureScaleMode(tex, SDL_SCALEMODE_NEAREST);
+        texH = H;
+    }
+    SDL_SetTextureColorMod(tex, (Uint8) (c.r * 255), (Uint8) (c.g * 255), (Uint8) (c.b * 255));
+    SDL_SetTextureAlphaMod(tex, (Uint8) (c.a * 255));
+    SDL_FRect dst = {SDL_floorf(cx - pr * 0.35f + 0.5f), SDL_floorf(cy - H / 2.0f + 0.5f),
+                     (float) W, (float) H};
+    SDL_RenderTexture(r, tex, NULL, &dst);
 }
 
 static void Logo(SDL_Renderer *r, float x, float y, float h) {
@@ -602,13 +654,7 @@ UIAction RunMenu(SDL_Window *window, SDL_Renderer *renderer,
         if (f0) Border(renderer, tileX, tileY, tileW, tileH, bt, 60, 170, 245);
         float pcx = tileX + tileW / 2, pcy = tileY + tileH * 0.42f, pr = tileH * 0.16f;
         Circle(renderer, pcx, pcy, pr, (SDL_FColor) {1, 1, 1, 1});
-        SDL_FColor navy = {0.04f, 0.07f, 0.15f, 1};
-        SDL_Vertex tri[3] = { /* play triangle */
-                {{pcx - pr * 0.35f, pcy - pr * 0.5f}, navy, {0, 0}},
-                {{pcx - pr * 0.35f, pcy + pr * 0.5f}, navy, {0, 0}},
-                {{pcx + pr * 0.55f, pcy}, navy, {0, 0}},
-        };
-        SDL_RenderGeometry(renderer, NULL, tri, 3, NULL, 0);
+        PlayTriangle(renderer, pcx, pcy, pr, (SDL_FColor) {0.04f, 0.07f, 0.15f, 1});
         Text(renderer, font, "Start Streaming", tileX, tileY + tileH * 0.72f, white, tileW);
 
         /* current settings, read-only under the Start tile */
