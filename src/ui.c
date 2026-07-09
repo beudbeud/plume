@@ -144,7 +144,10 @@ static SDL_Texture *DiscTexture(SDL_Renderer *r, int rad) {
     SDL_Texture *tex = SDL_CreateTextureFromSurface(r, s);
     SDL_DestroySurface(s);
     if (!tex) return NULL;
-    SDL_SetTextureScaleMode(tex, SDL_SCALEMODE_LINEAR);
+    /* Drawn 1:1 on an integer-aligned rect, so no resampling: NEAREST hands the
+     * CPU-computed edge to the screen untouched. LINEAR at a subpixel offset
+     * smeared the whole disc by half a pixel. */
+    SDL_SetTextureScaleMode(tex, SDL_SCALEMODE_NEAREST);
     /* A handful of radii exist per resolution; round-robin is eviction enough. */
     if (cache[next].tex) SDL_DestroyTexture(cache[next].tex);
     cache[next].rad = rad;
@@ -161,7 +164,7 @@ static void Circle(SDL_Renderer *r, float cx, float cy, float rad, SDL_FColor c)
     SDL_SetTextureColorMod(disc, (Uint8) (c.r * 255), (Uint8) (c.g * 255), (Uint8) (c.b * 255));
     SDL_SetTextureAlphaMod(disc, (Uint8) (c.a * 255));
     float D = (float) (irad * 2 + 2);
-    SDL_FRect dst = {cx - D / 2, cy - D / 2, D, D};
+    SDL_FRect dst = {SDL_floorf(cx - D / 2 + 0.5f), SDL_floorf(cy - D / 2 + 0.5f), D, D};
     SDL_RenderTexture(r, disc, NULL, &dst);
 }
 
