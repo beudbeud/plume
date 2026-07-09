@@ -115,6 +115,15 @@ Non-obvious fixes that must survive a rebase onto upstream:
 `ctest` covers the window and HID-report fixes; each test was verified to fail
 against the pre-fix code (the HID ones need ASan to trip).
 
+## License
+
+LGPL-3.0-or-later, in `COPYING.LESSER` (the Lesser terms) and `COPYING` (the GPL
+text they extend) — the FSF's prescribed pair.
+
+Plume links a patched IHSlib *statically*, so the whole binary is covered by
+IHSlib's LGPL. Publishing this source, patches included, is what satisfies the
+relinking requirement.
+
 ## Not included (add when needed)
 
 - Relative-mouse capture for FPS games (only absolute mouse is forwarded).
