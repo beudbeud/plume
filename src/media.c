@@ -125,6 +125,12 @@ static int VideoStart(IHS_Session *session, const IHS_StreamVideoConfig *config,
         bool useHw = attempt == 0 && hwCodec != NULL;
         const AVCodec *codec = useHw ? hwCodec : sw;
         vctx = avcodec_alloc_context3(codec);
+        /* h264_v4l2m2m sizes the driver's OUTPUT and CAPTURE queues at open time.
+         * Left at zero it opens blind and has to renegotiate on the first packet,
+         * which some kernels fail outright. Free for the software decoder, which
+         * would have read the same numbers out of the first SPS. */
+        vctx->width = (int) config->width;
+        vctx->height = (int) config->height;
         vctx->thread_count = 0; /* auto: one thread per core */
         if (useHw) {
             /* Hardware decode is single-frame-latency anyway; ask for it explicitly. */
