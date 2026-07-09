@@ -1,9 +1,9 @@
-/* FFmpeg (H264/HEVC + Opus) decode into an SDL2 window.
+/* FFmpeg (H264/HEVC + Opus) decode into an SDL3 window.
  *
- * IHSlib calls submit() on its own network thread; we decode there and stash
- * the latest frame under a mutex. MediaPresent() runs on the main thread and
- * uploads whatever is latest. Audio decodes straight to SDL's queue (thread
- * safe), so no locking needed for it.
+ * IHSlib calls submit() on its own network thread; we decode there and latch a
+ * reference to the newest frame under a mutex. MediaPresent() runs on the main
+ * thread and uploads whatever is latest. Audio decodes straight to SDL's queue
+ * (thread safe), so no locking needed for it.
  */
 #include "media.h"
 
@@ -20,6 +20,7 @@ static SDL_Window *window;
 static SDL_Renderer *renderer;
 static SDL_Texture *texture;
 static int texW, texH;
+static SDL_PixelFormat texFmt;
 
 /* ---- Video decode (network thread writes, main thread reads) ---- */
 static AVCodecContext *vctx;
@@ -27,8 +28,7 @@ static AVBufferRef *hwDeviceCtx;              /* HW decode device (Pi5 HEVC via 
 static enum AVPixelFormat hwPixFmt = AV_PIX_FMT_NONE;
 static struct SwsContext *sws;
 static SDL_Mutex *frameLock;
-static uint8_t *frameY, *frameU, *frameV; /* latest YUV420P planes */
-static int frameW, frameH;
+static AVFrame *latched; /* newest decoded frame; a ref into the decoder's pool, no copy */
 static bool frameDirty;
 /* The host's adaptive bitrate loop runs on what we report per frame, so the latch
  * tracks which frame is waiting: replacing an unshown one is a real dropped frame. */
@@ -53,7 +53,7 @@ void MediaAttach(SDL_Window *w, SDL_Renderer *r, bool enableAudio, MediaScale sc
     statsSession = NULL;
     framePending = false;
     frameLock = SDL_CreateMutex();
-    frameW = frameH = 0;
+    latched = av_frame_alloc();
     frameDirty = false;
 }
 
@@ -62,8 +62,7 @@ void MediaDetach(void) {
     framePending = false;
     if (texture) { SDL_DestroyTexture(texture); texture = NULL; texW = texH = 0; }
     if (frameLock) { SDL_DestroyMutex(frameLock); frameLock = NULL; }
-    free(frameY); free(frameU); free(frameV);
-    frameY = frameU = frameV = NULL;
+    av_frame_free(&latched);
     window = NULL;
     renderer = NULL;
 }
@@ -158,27 +157,16 @@ static int VideoStart(IHS_Session *session, const IHS_StreamVideoConfig *config,
     return -1;
 }
 
-/* Copy decoded YUV420P into our latch buffers under lock. */
-static void StashFrame(const AVFrame *f, uint16_t frameId) {
-    uint16_t dropped = 0;
-    bool hadPending;
+/* Take ownership of the decoded frame (moves the ref out of src). The decoder's
+ * buffers are refcounted, so holding one costs the pool a single extra frame —
+ * against a full-frame memcpy per frame under the lock. */
+static void StashFrame(AVFrame *src, uint16_t frameId) {
     SDL_LockMutex(frameLock);
-    if (frameW != f->width || frameH != f->height) {
-        free(frameY); free(frameU); free(frameV);
-        frameY = malloc((size_t) f->width * f->height);
-        frameU = malloc((size_t) (f->width / 2) * (f->height / 2));
-        frameV = malloc((size_t) (f->width / 2) * (f->height / 2));
-        frameW = f->width; frameH = f->height;
-    }
-    for (int y = 0; y < f->height; y++)
-        memcpy(frameY + (size_t) y * f->width, f->data[0] + (size_t) y * f->linesize[0], f->width);
-    for (int y = 0; y < f->height / 2; y++) {
-        memcpy(frameU + (size_t) y * (f->width / 2), f->data[1] + (size_t) y * f->linesize[1], f->width / 2);
-        memcpy(frameV + (size_t) y * (f->width / 2), f->data[2] + (size_t) y * f->linesize[2], f->width / 2);
-    }
+    av_frame_unref(latched);
+    av_frame_move_ref(latched, src);
     /* A frame still waiting when the next one lands was never shown. */
-    hadPending = framePending;
-    dropped = pendingFrameId;
+    bool hadPending = framePending;
+    uint16_t dropped = pendingFrameId;
     pendingFrameId = frameId;
     framePending = true;
     frameDirty = true;
@@ -222,11 +210,9 @@ static IHS_StreamVideoSubmitResult VideoSubmit(IHS_Session *session, uint16_t fr
                 dl = av_frame_alloc();
                 if (av_hwframe_transfer_data(dl, f, 0) == 0) sw = dl;
             }
-            /* Steam decode is yuv420p; NV12 (HW) and anything else go via swscale.
-             * ponytail: h264_v4l2m2m hands back NV12, so every Pi3/Pi4 frame pays a
-             * chroma de-interleave here. Upload it straight with SDL_UpdateNVTexture
-             * (SDL_PIXELFORMAT_NV12) if it shows up in the decode average. */
-            if (sw->format == AV_PIX_FMT_YUV420P) {
+            /* YUV420P and NV12 upload as-is (IYUV/NV12 textures); anything else
+             * goes via swscale. */
+            if (sw->format == AV_PIX_FMT_YUV420P || sw->format == AV_PIX_FMT_NV12) {
                 StashFrame(sw, frameId);
             } else {
                 sws = sws_getCachedContext(sws, sw->width, sw->height, sw->format,
@@ -272,19 +258,27 @@ void MediaPresent(void) {
     uint16_t shownId = 0;
     bool shown = false;
     SDL_LockMutex(frameLock);
-    if (frameDirty && frameW > 0) {
-        if (!texture || texW != frameW || texH != frameH) {
+    if (frameDirty && latched && latched->width > 0) {
+        SDL_PixelFormat fmt = latched->format == AV_PIX_FMT_NV12 ? SDL_PIXELFORMAT_NV12
+                                                                 : SDL_PIXELFORMAT_IYUV;
+        if (!texture || texW != latched->width || texH != latched->height || texFmt != fmt) {
             if (texture) SDL_DestroyTexture(texture);
-            texture = SDL_CreateTexture(renderer, SDL_PIXELFORMAT_IYUV,
-                                        SDL_TEXTUREACCESS_STREAMING, frameW, frameH);
-            texW = frameW; texH = frameH;
+            texture = SDL_CreateTexture(renderer, fmt, SDL_TEXTUREACCESS_STREAMING,
+                                        latched->width, latched->height);
+            texW = latched->width; texH = latched->height; texFmt = fmt;
         }
         if (framePending) IHS_SessionReportVideoFrameStage(statsSession, pendingFrameId,
                                                            IHS_VideoFrameStageUploadBegin, 0);
-        SDL_UpdateYUVTexture(texture, NULL,
-                             frameY, frameW,
-                             frameU, frameW / 2,
-                             frameV, frameW / 2);
+        if (fmt == SDL_PIXELFORMAT_NV12) {
+            SDL_UpdateNVTexture(texture, NULL,
+                                latched->data[0], latched->linesize[0],
+                                latched->data[1], latched->linesize[1]);
+        } else {
+            SDL_UpdateYUVTexture(texture, NULL,
+                                 latched->data[0], latched->linesize[0],
+                                 latched->data[1], latched->linesize[1],
+                                 latched->data[2], latched->linesize[2]);
+        }
         frameDirty = false;
         shown = framePending;
         shownId = pendingFrameId;
@@ -372,14 +366,13 @@ static int AudioSubmit(IHS_Session *session, IHS_Buffer *data, void *context) {
     if (avcodec_send_packet(actx, pkt) == 0) {
         AVFrame *f = av_frame_alloc();
         while (avcodec_receive_frame(actx, f) == 0) {
-            uint8_t *out = NULL;
-            int outSamples = swr_get_out_samples(swr, f->nb_samples);
-            av_samples_alloc(&out, NULL, audioChannels, outSamples, AV_SAMPLE_FMT_S16, 0);
-            int n = swr_convert(swr, &out, outSamples,
-                                (const uint8_t **) f->extended_data, f->nb_samples);
+            /* Opus caps at 120 ms per packet: 5760 samples/channel at 48 kHz. */
+            static int16_t pcm[5760 * 2];
+            uint8_t *out = (uint8_t *) pcm;
+            int cap = (int) (sizeof(pcm) / sizeof(pcm[0])) / audioChannels;
+            int n = swr_convert(swr, &out, cap, (const uint8_t **) f->extended_data, f->nb_samples);
             if (n > 0)
-                SDL_PutAudioStreamData(audioStream, out, n * audioChannels * (int) sizeof(int16_t));
-            av_freep(&out);
+                SDL_PutAudioStreamData(audioStream, pcm, n * audioChannels * (int) sizeof(int16_t));
         }
         av_frame_free(&f);
     }

@@ -36,6 +36,9 @@ static const struct { const char *label; int w, h, fps, kbps; } RES[] = {
 };
 #define RES_N ((int) SDL_arraysize(RES))
 
+static const char *SCALE_NAMES[] = {"Fit", "Stretch", "Crop"};
+#define SCALE_N ((int) SDL_arraysize(SCALE_NAMES))
+
 /* ---- draw helpers ---- */
 static void FillRect(SDL_Renderer *r, float x, float y, float w, float h,
                      Uint8 cr, Uint8 cg, Uint8 cb, Uint8 ca) {
@@ -150,8 +153,6 @@ static bool NavPoll(NavState *s, SDL_Gamepad *pad, int *dx, int *dy) {
 static void SettingsScreen(SDL_Renderer *renderer, TTF_Font *font, TTF_Font *titleFont,
                            SDL_Gamepad *pad, int *resIdx, bool *hevc, bool *audio, bool *desktop,
                            int *scale) {
-    static const char *SCALE_NAMES[] = {"Fit", "Stretch", "Crop"};
-    const int SCALE_N = (int) SDL_arraysize(SCALE_NAMES);
     enum { ROW_RES, ROW_SCALING, ROW_DESKTOP, ROW_HEVC, ROW_AUDIO, ROW_BACK, ROW_N };
     static const char *labels[ROW_N] = {"Resolution", "Scaling", "Desktop mode", "HEVC video", "Audio", "Back"};
     const SDL_Color white = {255, 255, 255, 255}, dim = {180, 195, 215, 255};
@@ -491,9 +492,8 @@ UIAction RunMenu(SDL_Window *window, SDL_Renderer *renderer, TTF_Font *font,
 
         /* current settings, read-only under the Start tile */
         char summary[64];
-        static const char *scaleNames[] = {"Fit", "Stretch", "Crop"};
         SDL_snprintf(summary, sizeof(summary), "%s  %s  %s  %s  %s", RES[resIdx].label,
-                     scaleNames[scale], desktop ? "Desktop" : "Game",
+                     SCALE_NAMES[scale], desktop ? "Desktop" : "Game",
                      hevc ? "HEVC" : "H264", audio ? "Audio" : "Muted");
         Text(renderer, font, summary, tileX, tileY + tileH + pad_ * 0.4f, dim, tileW);
 

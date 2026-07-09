@@ -392,16 +392,20 @@ static int DoStream(const IHS_HostInfo *host, bool audio) {
     bool disconnecting = false;
     while (g_running) {
         bool hidDirty = false;
+        bool padButton = false;
         SDL_Event e;
         while (SDL_PollEvent(&e)) {
             if (e.type == SDL_EVENT_QUIT ||
                 (e.type == SDL_EVENT_KEY_DOWN && e.key.key == SDLK_ESCAPE)) {
                 if (!disconnecting) { IHS_SessionDisconnect(session); disconnecting = true; }
             } else if (!disconnecting) {
+                padButton |= e.type == SDL_EVENT_GAMEPAD_BUTTON_DOWN;
                 hidDirty |= ForwardInput(session, &e);
             }
         }
-        if (!disconnecting && QuitComboHeld()) {
+        /* The combo can only become held on a button-down; skip the poll (and its
+         * SDL_GetGamepads allocation) on the other ~59 frames each second. */
+        if (!disconnecting && padButton && QuitComboHeld()) {
             IHS_SessionDisconnect(session);
             disconnecting = true;
         }
