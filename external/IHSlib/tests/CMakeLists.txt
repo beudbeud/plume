@@ -1,0 +1,25 @@
+set(TEST_INCLUDES ${CMAKE_CURRENT_SOURCE_DIR}/../include ${CMAKE_CURRENT_SOURCE_DIR}/../src ${CMAKE_CURRENT_SOURCE_DIR})
+
+function(ihs_add_test NAME SOURCES)
+    set(TEST_EXE "ihstest_${NAME}")
+    add_executable(${TEST_EXE} ${SOURCES})
+    add_test(${NAME} ${TEST_EXE})
+    target_include_directories(${TEST_EXE} PRIVATE ${TEST_INCLUDES})
+    target_link_libraries(${TEST_EXE} PRIVATE ihslib)
+    # Tests use `assert(call(...) == expected)` heavily, which silently drops the
+    # function call under NDEBUG (Release). Force assertions on for every test
+    # binary regardless of the project build type.
+    target_compile_options(${TEST_EXE} PRIVATE -UNDEBUG)
+    set_tests_properties(${NAME} PROPERTIES SKIP_RETURN_CODE 127)
+    set(IHSTEST_TARGET "${TEST_EXE}" PARENT_SCOPE)
+endfunction()
+
+add_subdirectory(common)
+
+ihs_add_test(arraylist test_arraylist.c)
+ihs_add_test(enumeration test_enumeration.c)
+ihs_add_test(crypto test_crypto.c)
+ihs_add_test(hid_report_batch test_hid_report_batch.c)
+
+add_subdirectory(hid)
+add_subdirectory(session)
