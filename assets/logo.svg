@@ -1,5 +1,5 @@
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 128 128">
-  <!-- Plume: three rising wisps of steam, the centre one ending in a quill tip.
+  <!-- Plume, "Aile": stream bars stacked into a wing, tip in ice.
        Colours are the launcher's palette. ui.c draws the same geometry live. -->
   <defs>
     <linearGradient id="tile" x1="0" y1="0" x2="1" y2="1">
@@ -8,9 +8,14 @@
     </linearGradient>
   </defs>
   <rect width="128" height="128" rx="24" fill="url(#tile)"/>
-  <g fill="none" stroke-linecap="round" transform="translate(64 64) scale(0.78) translate(-64 -64)">
-    <path d="M 44 100 C 34 86, 52 76, 43 60" stroke="#3caaf5" stroke-width="10"/>
-    <path d="M 86 100 C 94 86, 74 76, 84 60" stroke="#3caaf5" stroke-width="10"/>
-    <path d="M 64 108 C 48 88, 82 72, 66 48 C 58 36, 63 26, 76 18" stroke="#f2f7fc" stroke-width="10"/>
+  <g transform="translate(64 64) scale(0.82) translate(-64 -64)">
+    <g fill="#3caaf5">
+      <rect x="20" y="98" width="66" height="11" rx="5.5"/>
+      <rect x="30" y="82" width="62" height="11" rx="5.5"/>
+      <rect x="40" y="66" width="56" height="11" rx="5.5"/>
+      <rect x="50" y="50" width="48" height="11" rx="5.5"/>
+      <rect x="60" y="34" width="36" height="11" rx="5.5"/>
+    </g>
+    <rect x="70" y="18" width="20" height="11" rx="5.5" fill="#f2f7fc"/>
   </g>
 </svg>

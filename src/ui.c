@@ -123,31 +123,23 @@ static void Circle(SDL_Renderer *r, float cx, float cy, float rad, SDL_FColor c)
     SDL_RenderGeometry(r, NULL, v, N * 3, NULL, 0);
 }
 
-/* The Plume mark: three rising wisps of steam, the centre one ending in a quill
- * tip. SDL has no path stroking, so each cubic is stamped as overlapping dots.
+/* The Plume mark ("Aile"): stream bars stacked into a wing, tip in ice.
  * Geometry matches assets/logo.svg (authored on a 128 grid). */
-static void BezierStroke(SDL_Renderer *r, const float p[8], float sc, float ox, float oy,
-                         float rad, SDL_FColor c) {
-    enum { N = 22 };
-    for (int i = 0; i <= N; i++) {
-        float t = (float) i / N, u = 1 - t;
-        float x = u * u * u * p[0] + 3 * u * u * t * p[2] + 3 * u * t * t * p[4] + t * t * t * p[6];
-        float y = u * u * u * p[1] + 3 * u * u * t * p[3] + 3 * u * t * t * p[5] + t * t * t * p[7];
-        Circle(r, ox + x * sc, oy + y * sc, rad, c);
-    }
+static void Bar(SDL_Renderer *r, float x, float y, float w, float h, SDL_FColor c) {
+    Circle(r, x + h / 2, y + h / 2, h / 2, c);
+    Circle(r, x + w - h / 2, y + h / 2, h / 2, c);
+    SDL_SetRenderDrawColor(r, (Uint8) (c.r * 255), (Uint8) (c.g * 255), (Uint8) (c.b * 255), 255);
+    SDL_FRect body = {x + h / 2, y, w - h, h};
+    SDL_RenderFillRect(r, &body);
 }
 
 static void Logo(SDL_Renderer *r, float x, float y, float h) {
-    static const float left[8] = {44, 100, 34, 86, 52, 76, 43, 60};
-    static const float right[8] = {86, 100, 94, 86, 74, 76, 84, 60};
-    static const float mid1[8] = {64, 108, 48, 88, 82, 72, 66, 48};
-    static const float mid2[8] = {66, 48, 58, 36, 63, 26, 76, 18};
+    static const float bars[][3] = {{20, 98, 66}, {30, 82, 62}, {40, 66, 56}, {50, 50, 48}, {60, 34, 36}};
     const SDL_FColor accent = {0.24f, 0.67f, 0.96f, 1}, ice = {0.95f, 0.97f, 0.99f, 1};
-    float sc = h / 128.0f, rad = 5.0f * sc;
-    BezierStroke(r, left, sc, x, y, rad, accent);
-    BezierStroke(r, right, sc, x, y, rad, accent);
-    BezierStroke(r, mid1, sc, x, y, rad, ice);
-    BezierStroke(r, mid2, sc, x, y, rad, ice);
+    float sc = h / 128.0f, bh = 11 * sc;
+    for (size_t i = 0; i < SDL_arraysize(bars); i++)
+        Bar(r, x + bars[i][0] * sc, y + bars[i][1] * sc, bars[i][2] * sc, bh, accent);
+    Bar(r, x + 70 * sc, y + 18 * sc, 20 * sc, bh, ice);
 }
 
 /* Render text; returns width. Anchors top-left unless centered in [x,x+boxW]. */
