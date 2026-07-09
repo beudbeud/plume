@@ -40,7 +40,7 @@ static const char *SCALE_NAMES[] = {"Fit", "Stretch", "Crop"};
 #define SCALE_N ((int) SDL_arraysize(SCALE_NAMES))
 
 /* ---- fonts, sized from the live output mode ---- */
-static TTF_Font *uiFont, *uiTitleFont;
+static TTF_Font *uiFont, *uiTitleFont, *uiFontSmall;
 static int uiFontH;
 
 /* Find a usable TTF: env override, then common system/Recalbox locations. */
@@ -74,14 +74,16 @@ bool UIEnsureFonts(SDL_Renderer *renderer) {
     UICloseFonts();
     uiFont = LoadFont(oh / 24.0f);
     uiTitleFont = LoadFont(oh / 13.0f);
+    uiFontSmall = LoadFont(oh / 32.0f);
     uiFontH = oh;
-    return uiFont && uiTitleFont;
+    return uiFont && uiTitleFont && uiFontSmall;
 }
 
 void UICloseFonts(void) {
     if (uiFont) TTF_CloseFont(uiFont);
     if (uiTitleFont) TTF_CloseFont(uiTitleFont);
-    uiFont = uiTitleFont = NULL;
+    if (uiFontSmall) TTF_CloseFont(uiFontSmall);
+    uiFont = uiTitleFont = uiFontSmall = NULL;
     uiFontH = 0;
 }
 
@@ -149,7 +151,8 @@ static float Text(SDL_Renderer *r, TTF_Font *f, const char *s, float x, float y,
     if (!surf) return 0;
     SDL_Texture *tex = SDL_CreateTextureFromSurface(r, surf);
     float tw = (float) surf->w, th = (float) surf->h;
-    if (boxW > 0) x += (boxW - tw) / 2;
+    /* Centering a string wider than its box would start it off screen. */
+    if (boxW > 0 && tw < boxW) x += (boxW - tw) / 2;
     SDL_FRect dst = {x, y, tw, th};
     SDL_RenderTexture(r, tex, NULL, &dst);
     SDL_DestroyTexture(tex);
@@ -567,7 +570,7 @@ UIAction RunMenu(SDL_Window *window, SDL_Renderer *renderer,
         SDL_snprintf(summary, sizeof(summary), "%s  %s  %s  %s  %s", RES[resIdx].label,
                      SCALE_NAMES[scale], desktop ? "Desktop" : "Game",
                      hevc ? "HEVC" : "H264", audio ? "Audio" : "Muted");
-        Text(renderer, font, summary, tileX, tileY + tileH + pad_ * 0.4f, dim, tileW);
+        Text(renderer, uiFontSmall, summary, tileX, tileY + tileH + pad_ * 0.4f, dim, tileW);
 
         /* right column: host rows + gamepad status */
         float rowX = tileX + tileW + pad_, rowW = W - rowX - pad_;
