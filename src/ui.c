@@ -196,7 +196,10 @@ static float Text(SDL_Renderer *r, TTF_Font *f, const char *s, float x, float y,
     float tw = (float) surf->w, th = (float) surf->h;
     /* Centering a string wider than its box would start it off screen. */
     if (boxW > 0 && tw < boxW) x += (boxW - tw) / 2;
-    SDL_FRect dst = {x, y, tw, th};
+    /* Glyphs are rendered 1:1; a subpixel offset through LINEAR filtering
+     * smears them half a pixel. Pin to the pixel grid, copy untouched. */
+    SDL_SetTextureScaleMode(tex, SDL_SCALEMODE_NEAREST);
+    SDL_FRect dst = {SDL_floorf(x + 0.5f), SDL_floorf(y + 0.5f), tw, th};
     SDL_RenderTexture(r, tex, NULL, &dst);
     SDL_DestroyTexture(tex);
     SDL_DestroySurface(surf);
