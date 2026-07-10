@@ -176,11 +176,11 @@ static bool QuitComboHeld(void) {
 static int DoStream(const IHS_HostInfo *host, bool audio) {
     IHS_SessionInfo sinfo;
     IHS_StreamingResult res;
-    if (!PlumeRequestStream(host, g_width, g_height, g_desktop, &sinfo, &res)) {
+    if (!PlumeRequestStream(host, g_width, g_height, g_desktop, PlumeCountGamepads(), &sinfo, &res)) {
         /* Not paired yet -> pair from the UI, then retry once. */
         if (res != IHS_StreamingUnauthorized) return 1;
         if (!PairScreen(g_renderer, &PlumeClientConfig, host)) return 1;
-        if (!PlumeRequestStream(host, g_width, g_height, g_desktop, &sinfo, &res)) return 1;
+        if (!PlumeRequestStream(host, g_width, g_height, g_desktop, PlumeCountGamepads(), &sinfo, &res)) return 1;
     }
 
     MediaAttach(g_window, g_renderer, audio, (MediaScale) g_scale);

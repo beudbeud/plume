@@ -296,7 +296,7 @@ bool retro_load_game(const struct retro_game_info *info) {
      * PIN and let retro_run() show it; everything else is fatal. */
     IHS_StreamingResult res;
     IHS_SessionInfo sinfo;
-    if (!PlumeRequestStream(&g_host, g_width, g_height, g_desktop, &sinfo, &res)) {
+    if (!PlumeRequestStream(&g_host, g_width, g_height, g_desktop, PlumeCountGamepads(), &sinfo, &res)) {
         if (res != IHS_StreamingUnauthorized) {
             Log(RETRO_LOG_ERROR, "%s refused the stream (result=%d)", g_host.hostname, res);
             goto fail;
@@ -365,7 +365,7 @@ static void PairTick(void) {
     } else if (PlumePairFinish(&g_pairing)) {
         g_pairTicks = 0;
         IHS_SessionInfo sinfo;
-        if (PlumeRequestStream(&g_host, g_width, g_height, g_desktop, &sinfo, NULL) &&
+        if (PlumeRequestStream(&g_host, g_width, g_height, g_desktop, PlumeCountGamepads(), &sinfo, NULL) &&
             StartSession(&sinfo)) {
             return; /* g_state is now ST_STREAM */
         }

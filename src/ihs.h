@@ -20,6 +20,9 @@ void PlumeInitCreds(void);
  * "Segmentation fault" says nothing about which thread or which call. */
 void PlumeInstallCrashHandler(void);
 
+/* How many SDL gamepads are open right now — for the request's slot reservation. */
+int PlumeCountGamepads(void);
+
 /* IHS_LogFunction for IHS_{Client,Session}SetLogFunction. */
 void PlumeLog(IHS_LogLevel level, const char *tag, const char *message);
 
@@ -29,7 +32,7 @@ bool PlumeDiscoverHost(const char *wantIp, int timeoutSec, IHS_HostInfo *out);
 /* Ask the host for a stream. `result` (may be NULL) tells Unauthorized (= not
  * paired) apart from the other failures. */
 bool PlumeRequestStream(const IHS_HostInfo *host, int maxWidth, int maxHeight, bool desktop,
-                        IHS_SessionInfo *out, IHS_StreamingResult *result);
+                        int gamepadCount, IHS_SessionInfo *out, IHS_StreamingResult *result);
 
 /* ------------------------------- pairing ---------------------------------- */
 /* Split in two because the caller has to show the PIN while the host waits for

@@ -107,6 +107,13 @@ void PlumeInstallCrashHandler(void) {
     sigaction(SIGBUS, &sa, NULL);
 }
 
+int PlumeCountGamepads(void) {
+    int n = 0;
+    SDL_JoystickID *ids = SDL_GetGamepads(&n);
+    SDL_free(ids);
+    return n;
+}
+
 void PlumeLog(IHS_LogLevel level, const char *tag, const char *message) {
     /* Fatal < Error < Warn < Info < Debug < Verbose: below Warn is chatter. */
     if (!PlumeVerbose && level > IHS_LogLevelWarn) return;
@@ -226,7 +233,7 @@ static void OnStreamFailed(IHS_Client *c, const IHS_HostInfo *h, IHS_StreamingRe
 static void OnStreamProgress(IHS_Client *c, const IHS_HostInfo *h, void *ctx) { (void)c;(void)h;(void)ctx; }
 
 bool PlumeRequestStream(const IHS_HostInfo *host, int maxWidth, int maxHeight, bool desktop,
-                        IHS_SessionInfo *out, IHS_StreamingResult *result) {
+                        int gamepadCount, IHS_SessionInfo *out, IHS_StreamingResult *result) {
     IHS_Client *client = IHS_ClientCreate(&PlumeClientConfig);
     IHS_ClientSetLogFunction(client, PlumeLog);
     StreamReq req = {0};
@@ -240,6 +247,7 @@ bool PlumeRequestStream(const IHS_HostInfo *host, int maxWidth, int maxHeight, b
             /* Desktop off means we want the host's Big Picture / game session. */
             .streamingInterface = desktop ? IHS_StreamInterfaceDesktop : IHS_StreamInterfaceBigPicture,
             .streamDesktop = desktop,
+            .gamepadCount = gamepadCount,
     };
     /* Discovery keeps the worker thread alive and the socket serviced; without
      * it ThreadedJoin returns instantly and the request is never delivered. */
