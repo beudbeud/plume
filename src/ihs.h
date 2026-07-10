@@ -16,6 +16,10 @@ void PlumeDataPath(char *out, size_t n, const char *name);
 /* Load creds.bin, or make and save a fresh identity. Fills PlumeClientConfig. */
 void PlumeInitCreds(void);
 
+/* Print a stack trace on a fatal signal. The target has no debugger, and a bare
+ * "Segmentation fault" says nothing about which thread or which call. */
+void PlumeInstallCrashHandler(void);
+
 /* IHS_LogFunction for IHS_{Client,Session}SetLogFunction. */
 void PlumeLog(IHS_LogLevel level, const char *tag, const char *message);
 

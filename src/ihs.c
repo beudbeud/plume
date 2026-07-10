@@ -7,6 +7,9 @@
 #include <unistd.h>
 #include <sys/stat.h>
 
+#include <signal.h>
+#include <execinfo.h>
+
 #include <SDL3/SDL.h>
 #include "ihs.h"
 
@@ -55,6 +58,22 @@ void PlumeInitCreds(void) {
     if (gethostname(g_deviceName, sizeof(g_deviceName)) != 0)
         strcpy(g_deviceName, "plume");
     PlumeClientConfig = (IHS_ClientConfig) {g_deviceId, g_secretKey, g_deviceName};
+}
+
+static void OnFatalSignal(int sig) {
+    void *frames[32];
+    int n = backtrace(frames, 32);
+    fprintf(stderr, "\n*** fatal signal %d (%s), %d frames:\n", sig, strsignal(sig), n);
+    fflush(stderr);
+    backtrace_symbols_fd(frames, n, STDERR_FILENO);
+    signal(sig, SIG_DFL);
+    raise(sig); /* let it dump a core if the system is configured for it */
+}
+
+void PlumeInstallCrashHandler(void) {
+    signal(SIGSEGV, OnFatalSignal);
+    signal(SIGABRT, OnFatalSignal);
+    signal(SIGBUS, OnFatalSignal);
 }
 
 void PlumeLog(IHS_LogLevel level, const char *tag, const char *message) {

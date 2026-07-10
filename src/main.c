@@ -15,8 +15,6 @@
 #include <string.h>
 #include <unistd.h>
 #include <sys/stat.h>
-#include <signal.h>
-#include <execinfo.h>
 
 #include <SDL3/SDL.h>
 #include <SDL3_ttf/SDL_ttf.h>
@@ -37,19 +35,6 @@ static int g_width = 1920, g_height = 1080, g_fps = 60, g_kbps = 15000; /* host 
 static bool g_audio = true;
 static bool g_desktop = true; /* stream the host's desktop, else its game session */
 static int g_scale = MEDIA_SCALE_FIT; /* fit / stretch / crop on aspect mismatch */
-
-/* ----------------------------- logging ------------------------------------ */
-/* Print a stack trace on a fatal signal. The target has no debugger, and a bare
- * "Segmentation fault" says nothing about which thread or which call. */
-static void OnFatalSignal(int sig) {
-    void *frames[32];
-    int n = backtrace(frames, 32);
-    fprintf(stderr, "\n*** fatal signal %d (%s), %d frames:\n", sig, strsignal(sig), n);
-    fflush(stderr);
-    backtrace_symbols_fd(frames, n, STDERR_FILENO);
-    signal(sig, SIG_DFL);
-    raise(sig); /* let it dump a core if the system is configured for it */
-}
 
 /* ------------------------------ pairing ----------------------------------- */
 static int DoPair(const IHS_HostInfo *host) {
@@ -282,9 +267,7 @@ int main(int argc, char *argv[]) {
         }
     }
 
-    signal(SIGSEGV, OnFatalSignal);
-    signal(SIGABRT, OnFatalSignal);
-    signal(SIGBUS, OnFatalSignal);
+    PlumeInstallCrashHandler();
 
     IHS_Init();
     PlumeInitCreds();

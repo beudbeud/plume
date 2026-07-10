@@ -146,6 +146,10 @@ static void ForwardMouse(void) {
 /* --------------------------- libretro entry points ------------------------ */
 void retro_init(void) {
     PlumeVerbose = getenv("PLUME_VERBOSE") != NULL;
+    SDL_SetLogPriorities(PlumeVerbose ? SDL_LOG_PRIORITY_INFO : SDL_LOG_PRIORITY_WARN);
+    /* A core that segfaults inside RetroArch prints nothing but "Segmentation
+     * fault", and the frame loop spans three threads. */
+    PlumeInstallCrashHandler();
     g_frame = calloc(MAX_W * MAX_H, sizeof(*g_frame));
 }
 

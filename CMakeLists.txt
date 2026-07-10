@@ -71,7 +71,11 @@ if(PLUME_LIBRETRO)
     add_library(plume_libretro SHARED src/libretro.c src/media.c src/ihs.c)
     set_target_properties(plume_libretro PROPERTIES PREFIX "")
     target_include_directories(plume_libretro PRIVATE external ${SDL3_INCLUDE_DIRS} ${FFMPEG_INCLUDE_DIRS})
-    target_compile_options(plume_libretro PRIVATE ${SDL3_CFLAGS_OTHER} ${FFMPEG_CFLAGS_OTHER})
+    target_compile_options(plume_libretro PRIVATE ${SDL3_CFLAGS_OTHER} ${FFMPEG_CFLAGS_OTHER}
+            -g -fno-omit-frame-pointer)
+    # -rdynamic so the crash handler's backtrace names our functions. Note that
+    # --exclude-libs below still hides SDL3, so it stays out of the dynamic table.
+    target_link_options(plume_libretro PRIVATE -rdynamic)
 
     if(PLUME_LIBRETRO_STATIC_SDL)
         set(_suffixes ${CMAKE_FIND_LIBRARY_SUFFIXES})
