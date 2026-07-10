@@ -120,12 +120,26 @@ static void OnConfiguring(IHS_Session *s, IHS_SessionConfig *cfg, void *ctx) {
 
 static void OnDisconnected(IHS_Session *s, void *ctx) { (void) s; (void) ctx; g_running = false; }
 
+/* Claim the gamepads only once the session is up. IHSlib enumerates a provider
+ * on its timer thread, and a provider added before IHS_SessionConnect() races
+ * the handshake: here RetroArch spends over a second in its KMS/EGL init while
+ * our ClientHandshake is being retransmitted, the timer wins, and RemoteHID
+ * goes out before AuthenticationRequest. The host answers nothing after that.
+ * `connected` fires right after NegotiationComplete (ch_control_negotiation.c),
+ * which is where the standalone client happens to send its own RemoteHID. */
+static void OnConnected(IHS_Session *s, void *ctx) {
+    (void) ctx;
+    g_hid = IHS_HIDProviderSDLCreateManaged();
+    IHS_SessionHIDAddProvider(s, g_hid);
+}
+
 /* IHSlib keeps the pointer, not a copy (session_pri.h: `const
  * IHS_StreamSessionCallbacks *session`), and calls configuring() from its worker
  * thread once negotiation starts — long after whoever set it has returned. A
  * local would be a dead stack frame by then. */
 static const IHS_StreamSessionCallbacks SESSION_CALLBACKS = {
         .configuring = OnConfiguring,
+        .connected = OnConnected,
         .disconnected = OnDisconnected,
 };
 
@@ -226,13 +240,9 @@ static bool StartSession(const IHS_SessionInfo *sinfo) {
     IHS_SessionSetSessionCallbacks(g_session, &SESSION_CALLBACKS, NULL);
     IHS_SessionSetVideoCallbacks(g_session, &VideoCallbacks, NULL);
     IHS_SessionSetAudioCallbacks(g_session, &AudioCallbacks, NULL);
-    g_hid = IHS_HIDProviderSDLCreateManaged();
-    IHS_SessionHIDAddProvider(g_session, g_hid);
-
-    if (!IHS_SessionConnect(g_session)) {
+    if (!IHS_SessionConnect(g_session)) { /* OnConnected adds the HID provider */
         Log(RETRO_LOG_ERROR, "Failed to connect the session");
         IHS_SessionDestroy(g_session);
-        IHS_HIDProviderSDLDestroy(g_hid);
         g_session = NULL;
         MediaDetach();
         return false;
@@ -320,7 +330,7 @@ void retro_unload_game(void) {
     if (g_running) IHS_SessionDisconnect(g_session);
     IHS_SessionThreadedJoin(g_session);
     IHS_SessionDestroy(g_session); /* closes its devices, so destroy the provider after */
-    IHS_HIDProviderSDLDestroy(g_hid);
+    if (g_hid) { IHS_HIDProviderSDLDestroy(g_hid); g_hid = NULL; } /* NULL if we never connected */
     g_session = NULL;
     MediaDetach();
     IHS_Quit();
