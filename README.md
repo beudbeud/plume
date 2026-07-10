@@ -59,6 +59,31 @@ resumes automatically once approved. (`--pair` does the same headlessly.)
 Leave a running stream with **Hotkey + Start** on the gamepad (Hotkey = Guide/Home,
 or Select if the pad has no Guide), or Esc on the keyboard.
 
+## libretro core
+
+The same decode and session code also builds as `build/plume_libretro.so`, so
+RetroArch can stream a Steam host like any other core. Off by default:
+
+```sh
+cmake -B build -DCMAKE_BUILD_TYPE=Release -DPLUME_LIBRETRO=ON
+cmake --build build -j
+```
+
+Copy it and `plume_libretro.info` next to your other cores.
+
+Start it with no content to stream from the first host on the LAN, or load a
+`.plume` file whose first line is the host's IP. An unpaired host makes the core
+show a PIN as a frontend message and wait 90 s for Steam to approve it, then the
+stream starts on its own — no `plume --pair` needed.
+
+`-DPLUME_APP=OFF` builds the core alone, dropping SDL_ttf and the font the
+launcher needs. That is what the Recalbox package does.
+
+Resolution, audio, desktop mode and HEVC are core options (read once, at load —
+they are negotiated with the host). Gamepads reach the host through the same HID
+channel the standalone client uses; the mouse is forwarded, the keyboard is not.
+Frames are converted to XRGB8888 for the frontend, one full-frame pass each.
+
 ## Settings
 
 The **≡** screen writes `~/.local/share/plume/settings.conf` (plain

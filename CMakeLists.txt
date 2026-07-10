@@ -13,6 +13,10 @@ set(IHSLIB_CODEGEN OFF CACHE BOOL "" FORCE)
 # self-contained. (Shadows the cache var for this scope + the IHSlib subdir.)
 set(BUILD_SHARED_LIBS OFF)
 
+# ...but the libretro core *is* a shared object, and it swallows those static
+# libs whole. Without PIC the link fails outright on x86-64.
+set(CMAKE_POSITION_INDEPENDENT_CODE ON)
+
 # Prefer a vendored copy (git submodule) so offline builds work — this is the
 # path Buildroot/Recalbox takes. Fall back to fetching it for a plain dev clone.
 if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/external/IHSlib/CMakeLists.txt)
@@ -25,11 +29,20 @@ else()
     FetchContent_MakeAvailable(ihslib)
 endif()
 
+# The launcher needs SDL_ttf (and a font) to draw its menu; the libretro core has
+# no UI of its own, so a core-only build (Recalbox) can drop both.
+option(PLUME_APP "Build the standalone client" ON)
+
 find_package(PkgConfig REQUIRED)
-pkg_check_modules(SDL3 REQUIRED sdl3 sdl3-ttf)
+if(PLUME_APP)
+    pkg_check_modules(SDL3 REQUIRED sdl3 sdl3-ttf)
+else()
+    pkg_check_modules(SDL3 REQUIRED sdl3)
+endif()
 pkg_check_modules(FFMPEG REQUIRED libavcodec libavutil libswscale libswresample)
 
-add_executable(plume src/main.c src/media.c src/ui.c)
+if(PLUME_APP)
+add_executable(plume src/main.c src/media.c src/ui.c src/ihs.c)
 # Keep frame pointers and export symbols so the SIGSEGV handler's backtrace names
 # functions instead of bare addresses. Costs nothing measurable here.
 target_compile_options(plume PRIVATE -g -fno-omit-frame-pointer)
@@ -39,3 +52,15 @@ target_include_directories(plume PRIVATE ${SDL3_INCLUDE_DIRS} ${FFMPEG_INCLUDE_D
 # through the HID channel.
 target_link_libraries(plume PRIVATE ihslib ihslib-hid-sdl ${SDL3_LIBRARIES} ${FFMPEG_LIBRARIES})
 target_compile_options(plume PRIVATE ${SDL3_CFLAGS_OTHER} ${FFMPEG_CFLAGS_OTHER})
+endif()
+
+# libretro core: same decode and session code, no window of its own. RetroArch
+# takes the frames and samples; SDL is still here for the gamepad->HID bridge.
+option(PLUME_LIBRETRO "Build the libretro core" OFF)
+if(PLUME_LIBRETRO)
+    add_library(plume_libretro SHARED src/libretro.c src/media.c src/ihs.c)
+    set_target_properties(plume_libretro PROPERTIES PREFIX "")
+    target_include_directories(plume_libretro PRIVATE external ${SDL3_INCLUDE_DIRS} ${FFMPEG_INCLUDE_DIRS})
+    target_link_libraries(plume_libretro PRIVATE ihslib ihslib-hid-sdl ${SDL3_LIBRARIES} ${FFMPEG_LIBRARIES})
+    target_compile_options(plume_libretro PRIVATE ${SDL3_CFLAGS_OTHER} ${FFMPEG_CFLAGS_OTHER})
+endif()

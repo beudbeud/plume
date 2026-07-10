@@ -23,6 +23,7 @@
 #include "ihslib.h"
 #include "ihslib/client.h"
 #include "ihslib/hid/sdl.h"
+#include "ihs.h"
 #include "media.h"
 #include "ui.h"
 
@@ -30,67 +31,14 @@
 static SDL_Window *g_window;
 static SDL_Renderer *g_renderer;
 
-/* -------- persistent device identity (so pairing survives restarts) -------- */
-static uint64_t g_deviceId;
-static uint8_t g_secretKey[32];
-static char g_deviceName[64];
-static IHS_ClientConfig g_config;
-
 /* -------- user settings, from settings.conf then argv then the menu -------- */
 static bool g_hevc = false; /* --hevc: request HEVC (HW decode on Pi5) */
 static int g_width = 1920, g_height = 1080, g_fps = 60, g_kbps = 15000; /* host encode cap */
 static bool g_audio = true;
 static bool g_desktop = true; /* stream the host's desktop, else its game session */
 static int g_scale = MEDIA_SCALE_FIT; /* fit / stretch / crop on aspect mismatch */
-static bool g_verbose = false; /* --verbose: everything; otherwise warnings and worse */
-
-static void DataPath(char *out, size_t n, const char *name) {
-    const char *home = getenv("HOME");
-    if (!home) home = ".";
-    char dir[400];
-    snprintf(dir, sizeof(dir), "%s/.local/share/plume", home);
-    if (mkdir(dir, 0700) == 0) {
-        /* We just created it, so this is the first run since the project was
-         * renamed from steamlink-ihs. Adopt the old directory whole, or the
-         * user silently loses their pairing and has to re-enter the PIN. */
-        char old[400];
-        snprintf(old, sizeof(old), "%s/.local/share/steamlink-ihs", home);
-        if (rmdir(dir) == 0 && rename(old, dir) != 0) {
-            mkdir(dir, 0700); /* nothing to adopt; put ours back */
-        }
-    }
-    snprintf(out, n, "%s/%s", dir, name);
-}
-
-static void LoadOrCreateCreds(void) {
-    char path[512];
-    DataPath(path, sizeof(path), "creds.bin");
-    FILE *f = fopen(path, "rb");
-    if (f && fread(&g_deviceId, 8, 1, f) == 1 && fread(g_secretKey, 32, 1, f) == 1) {
-        fclose(f);
-    } else {
-        if (f) fclose(f);
-        FILE *r = fopen("/dev/urandom", "rb");
-        if (!r || fread(&g_deviceId, 8, 1, r) != 1 || fread(g_secretKey, 32, 1, r) != 1) {
-            fprintf(stderr, "cannot read /dev/urandom\n");
-            exit(1);
-        }
-        fclose(r);
-        FILE *w = fopen(path, "wb");
-        if (w) { fwrite(&g_deviceId, 8, 1, w); fwrite(g_secretKey, 32, 1, w); fclose(w); }
-    }
-    if (gethostname(g_deviceName, sizeof(g_deviceName)) != 0)
-        strcpy(g_deviceName, "plume");
-    g_config = (IHS_ClientConfig) {g_deviceId, g_secretKey, g_deviceName};
-}
 
 /* ----------------------------- logging ------------------------------------ */
-static void LogPrint(IHS_LogLevel level, const char *tag, const char *message) {
-    /* Fatal < Error < Warn < Info < Debug < Verbose: below Warn is chatter. */
-    if (!g_verbose && level > IHS_LogLevelWarn) return;
-    fprintf(stderr, "[IHS.%s %s] %s\n", tag, IHS_LogLevelName(level), message);
-}
-
 /* Print a stack trace on a fatal signal. The target has no debugger, and a bare
  * "Segmentation fault" says nothing about which thread or which call. */
 static void OnFatalSignal(int sig) {
@@ -103,132 +51,17 @@ static void OnFatalSignal(int sig) {
     raise(sig); /* let it dump a core if the system is configured for it */
 }
 
-/* --------------------- discovery: pick a host ----------------------------- */
-typedef struct {
-    const char *wantIp;   /* NULL = accept first */
-    bool found;
-    IHS_HostInfo host;
-} HostPick;
-
-static void OnDiscovered(IHS_Client *client, const IHS_HostInfo *info, void *ctx) {
-    HostPick *p = ctx;
-    if (p->found) return;
-    if (p->wantIp) {
-        char *ip = IHS_IPAddressToString(&info->address.ip);
-        bool match = ip && strcmp(ip, p->wantIp) == 0;
-        free(ip);
-        if (!match) return;
-    }
-    p->host = *info;
-    p->found = true;
-    if (g_verbose) printf("Found host: %s\n", info->hostname);
-    IHS_ClientStop(client);
-}
-
-/* Discover with a timeout (seconds); returns picked host or NULL. */
-static bool DiscoverHost(const char *wantIp, int timeoutSec, IHS_HostInfo *out) {
-    IHS_Client *client = IHS_ClientCreate(&g_config);
-    IHS_ClientSetLogFunction(client, LogPrint);
-    HostPick pick = {.wantIp = wantIp};
-    IHS_ClientDiscoveryCallbacks cb = {.discovered = OnDiscovered};
-    IHS_ClientSetDiscoveryCallbacks(client, &cb, &pick);
-    IHS_ClientStartDiscovery(client, 1000);
-    for (int i = 0; i < timeoutSec * 10 && !pick.found; i++) SDL_Delay(100);
-    IHS_ClientStopDiscovery(client);
-    IHS_ClientStop(client);
-    IHS_ClientThreadedJoin(client);
-    IHS_ClientDestroy(client);
-    if (pick.found) *out = pick.host;
-    return pick.found;
-}
-
 /* ------------------------------ pairing ----------------------------------- */
-typedef struct { bool done; bool ok; } AuthState;
-
-static void OnAuthSuccess(IHS_Client *c, const IHS_HostInfo *h, uint64_t steamId, void *ctx) {
-    (void) h;
-    printf("Paired (steamId=%llu)\n", (unsigned long long) steamId);
-    AuthState *s = ctx; s->done = true; s->ok = true;
-    IHS_ClientStop(c);
-}
-static void OnAuthFailed(IHS_Client *c, const IHS_HostInfo *h, IHS_AuthorizationResult r, void *ctx) {
-    (void) h;
-    printf("Pairing failed (result=%d)\n", r);
-    AuthState *s = ctx; s->done = true;
-    IHS_ClientStop(c);
-}
-static void OnAuthProgress(IHS_Client *c, const IHS_HostInfo *h, void *ctx) { (void)c;(void)h;(void)ctx; }
-
 static int DoPair(const IHS_HostInfo *host) {
     /* PIN the user must type into Steam on the host to approve this device. */
-    uint32_t r = 0;
-    FILE *ur = fopen("/dev/urandom", "rb");
-    if (ur) { fread(&r, sizeof(r), 1, ur); fclose(ur); }
     char pin[5];
-    snprintf(pin, sizeof(pin), "%04u", r % 10000);
+    PlumeMakePin(pin);
     printf("\n  Enter this PIN in Steam on the host to approve:  %s\n\n", pin);
 
-    IHS_Client *client = IHS_ClientCreate(&g_config);
-    IHS_ClientSetLogFunction(client, LogPrint);
-    AuthState st = {0};
-    IHS_ClientAuthorizationCallbacks cb = {
-            .progress = OnAuthProgress, .success = OnAuthSuccess, .failed = OnAuthFailed};
-    IHS_ClientSetAuthorizationCallbacks(client, &cb, &st);
-    /* Discovery keeps the worker thread alive and the socket serviced; without
-     * it ThreadedJoin returns instantly and the request is never delivered. */
-    IHS_ClientStartDiscovery(client, 0);
-    IHS_ClientAuthorizationRequest(client, host, pin);
-    IHS_ClientThreadedJoin(client);
-    IHS_ClientStopDiscovery(client);
-    IHS_ClientDestroy(client);
-    return st.ok ? 0 : 1;
-}
-
-/* -------------------- streaming request -> session info ------------------- */
-typedef struct { bool done; bool ok; IHS_SessionInfo info; IHS_StreamingResult result; } StreamReq;
-
-static void OnStreamSuccess(IHS_Client *c, const IHS_HostInfo *h, const IHS_SocketAddress *addr,
-                            const uint8_t *key, size_t keyLen, void *ctx) {
-    (void) h;
-    StreamReq *s = ctx;
-    s->info.address = *addr;
-    s->info.sessionKeyLen = keyLen;
-    memcpy(s->info.sessionKey, key, keyLen);
-    s->info.steamId = 0;
-    s->done = true; s->ok = true;
-    IHS_ClientStop(c);
-}
-static void OnStreamFailed(IHS_Client *c, const IHS_HostInfo *h, IHS_StreamingResult r, void *ctx) {
-    (void) h;
-    fprintf(stderr, "Streaming request failed (result=%d)\n", r);
-    StreamReq *s = ctx; s->done = true; s->result = r;
-    IHS_ClientStop(c);
-}
-static void OnStreamProgress(IHS_Client *c, const IHS_HostInfo *h, void *ctx) { (void)c;(void)h;(void)ctx; }
-
-static bool RequestStream(const IHS_HostInfo *host, IHS_SessionInfo *out, IHS_StreamingResult *result) {
-    IHS_Client *client = IHS_ClientCreate(&g_config);
-    IHS_ClientSetLogFunction(client, LogPrint);
-    StreamReq req = {0};
-    IHS_ClientStreamingCallbacks cb = {
-            .progress = OnStreamProgress, .success = OnStreamSuccess, .failed = OnStreamFailed};
-    IHS_ClientSetStreamingCallbacks(client, &cb, &req);
-    IHS_StreamingRequest r = {
-            .streamingEnable = {true, true, true},
-            .maxResolution = {g_width, g_height},
-            .audioChannelCount = 2,
-            /* Desktop off means we want the host's Big Picture / game session. */
-            .streamingInterface = g_desktop ? IHS_StreamInterfaceDesktop : IHS_StreamInterfaceBigPicture,
-            .streamDesktop = g_desktop,
-    };
-    IHS_ClientStartDiscovery(client, 0); /* keeps the worker thread alive (see DoPair) */
-    IHS_ClientStreamingRequest(client, host, &r);
-    IHS_ClientThreadedJoin(client);
-    IHS_ClientStopDiscovery(client);
-    IHS_ClientDestroy(client);
-    if (req.ok) *out = req.info;
-    if (result) *result = req.result;
-    return req.ok;
+    PlumePairing p;
+    if (!PlumePairStart(&p, host, pin)) return 1;
+    while (!p.done) SDL_Delay(100); /* nothing to draw here; just wait it out */
+    return PlumePairFinish(&p) ? 0 : 1;
 }
 
 /* ------------------------------- session ---------------------------------- */
@@ -240,12 +73,12 @@ static void OnDisconnected(IHS_Session *s, void *ctx) { (void)s;(void)ctx; g_run
  * Unknown keys are ignored, so a newer file stays readable by an older build. */
 static void LoadSettings(void) {
     char path[512];
-    DataPath(path, sizeof(path), "settings.conf");
+    PlumeDataPath(path, sizeof(path), "settings.conf");
     FILE *f = fopen(path, "r");
     if (!f) {
         /* Silently running on defaults after the user picked 480p in the menu is
          * the kind of thing you chase for an hour. $HOME decides where this lives. */
-        if (g_verbose) fprintf(stderr, "settings: %s absent, using defaults\n", path);
+        if (PlumeVerbose) fprintf(stderr, "settings: %s absent, using defaults\n", path);
         return;
     }
     char key[64];
@@ -268,14 +101,14 @@ static void LoadSettings(void) {
     if (g_fps <= 0) g_fps = 60;
     if (g_kbps <= 0) g_kbps = 15000;
     if (g_scale < MEDIA_SCALE_FIT || g_scale > MEDIA_SCALE_CROP) g_scale = MEDIA_SCALE_FIT;
-    if (g_verbose)
+    if (PlumeVerbose)
         fprintf(stderr, "settings: %s -> %dx%d @ %d fps, %d kbps, scaling %d, hevc %d, audio %d, desktop %d\n",
                 path, g_width, g_height, g_fps, g_kbps, g_scale, g_hevc, g_audio, g_desktop);
 }
 
 static void SaveSettings(void) {
     char path[512];
-    DataPath(path, sizeof(path), "settings.conf");
+    PlumeDataPath(path, sizeof(path), "settings.conf");
     FILE *f = fopen(path, "w");
     if (!f) return;
     fprintf(f, "width %d\nheight %d\nfps %d\nkbps %d\nhevc %d\naudio %d\ndesktop %d\nscaling %d\n",
@@ -358,19 +191,19 @@ static bool QuitComboHeld(void) {
 static int DoStream(const IHS_HostInfo *host, bool audio) {
     IHS_SessionInfo sinfo;
     IHS_StreamingResult res;
-    if (!RequestStream(host, &sinfo, &res)) {
+    if (!PlumeRequestStream(host, g_width, g_height, g_desktop, &sinfo, &res)) {
         /* Not paired yet -> pair from the UI, then retry once. */
         if (res != IHS_StreamingUnauthorized) return 1;
-        if (!PairScreen(g_renderer, &g_config, host)) return 1;
-        if (!RequestStream(host, &sinfo, &res)) return 1;
+        if (!PairScreen(g_renderer, &PlumeClientConfig, host)) return 1;
+        if (!PlumeRequestStream(host, g_width, g_height, g_desktop, &sinfo, &res)) return 1;
     }
 
     MediaAttach(g_window, g_renderer, audio, (MediaScale) g_scale);
 
     g_running = true; /* reset: OnDisconnected clears it */
     IHS_StreamSessionCallbacks scb = {.configuring = OnConfiguring, .disconnected = OnDisconnected};
-    IHS_Session *session = IHS_SessionCreate(&g_config, &sinfo);
-    IHS_SessionSetLogFunction(session, LogPrint);
+    IHS_Session *session = IHS_SessionCreate(&PlumeClientConfig, &sinfo);
+    IHS_SessionSetLogFunction(session, PlumeLog);
     IHS_SessionSetSessionCallbacks(session, &scb, NULL);
     IHS_SessionSetVideoCallbacks(session, &VideoCallbacks, NULL);
     IHS_SessionSetAudioCallbacks(session, &AudioCallbacks, NULL);
@@ -433,8 +266,8 @@ int main(int argc, char *argv[]) {
     bool pair = false;
     const char *hostIp = NULL;
     /* --verbose is read first: LoadSettings already logs. */
-    for (int i = 1; i < argc; i++) if (!strcmp(argv[i], "--verbose")) g_verbose = true;
-    SDL_SetLogPriorities(g_verbose ? SDL_LOG_PRIORITY_INFO : SDL_LOG_PRIORITY_WARN);
+    for (int i = 1; i < argc; i++) if (!strcmp(argv[i], "--verbose")) PlumeVerbose = true;
+    SDL_SetLogPriorities(PlumeVerbose ? SDL_LOG_PRIORITY_INFO : SDL_LOG_PRIORITY_WARN);
     LoadSettings(); /* before argv, so flags win over the saved file */
     for (int i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "--pair")) pair = true;
@@ -454,14 +287,14 @@ int main(int argc, char *argv[]) {
     signal(SIGBUS, OnFatalSignal);
 
     IHS_Init();
-    LoadOrCreateCreds();
+    PlumeInitCreds();
 
     /* --pair keeps the headless flow: discover one host, pair, exit. */
     if (pair) {
         IHS_HostInfo host;
         printf("Discovering hosts%s...\n", hostIp ? " (filtered)" : ""); /* --pair is interactive: always shown */
         int rc = 1;
-        if (DiscoverHost(hostIp, 10, &host)) rc = DoPair(&host);
+        if (PlumeDiscoverHost(hostIp, 10, &host)) rc = DoPair(&host);
         else fprintf(stderr, "No host found. Is Steam running on the LAN with Remote Play enabled?\n");
         IHS_Quit();
         return rc;
@@ -492,7 +325,7 @@ int main(int argc, char *argv[]) {
     for (;;) {
         UIResult r = {.hevc = g_hevc, .audio = g_audio, .desktop = g_desktop, .scale = g_scale,
                       .width = g_width, .height = g_height, .fps = g_fps, .kbps = g_kbps};
-        UIAction act = RunMenu(g_window, g_renderer, &g_config, &r);
+        UIAction act = RunMenu(g_window, g_renderer, &PlumeClientConfig, &r);
         g_hevc = r.hevc; g_audio = r.audio; g_desktop = r.desktop; g_scale = r.scale;
         g_width = r.width; g_height = r.height; g_fps = r.fps; g_kbps = r.kbps;
         SaveSettings();

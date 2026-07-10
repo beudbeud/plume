@@ -1,0 +1,13 @@
+display_name = "Steam Remote Play (Plume)"
+authors = "Adrien Beudin|mariotaku"
+supported_extensions = "plume"
+corename = "Plume"
+license = "LGPL-3.0-or-later"
+permissions = ""
+display_version = "1.0"
+categories = "Application"
+database = ""
+notes = "Pair once with 'plume --pair'. Load a .plume file holding the host's IP, or start the core with no content to stream from the first host found on the LAN."
+supports_no_game = "true"
+required_hw_api = ""
+firmware_count = 0

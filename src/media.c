@@ -27,6 +27,7 @@ static AVCodecContext *vctx;
 static AVBufferRef *hwDeviceCtx;              /* HW decode device (Pi5 HEVC via V4L2-request/DRM) */
 static enum AVPixelFormat hwPixFmt = AV_PIX_FMT_NONE;
 static struct SwsContext *sws;
+static struct SwsContext *swsOut;             /* headless: YUV -> XRGB8888 for the caller */
 static SDL_Mutex *frameLock;
 static AVFrame *latched; /* newest decoded frame; a ref into the decoder's pool, no copy */
 static bool frameDirty;
@@ -61,6 +62,7 @@ void MediaDetach(void) {
     statsSession = NULL; /* the session is being torn down; never report into it */
     framePending = false;
     if (texture) { SDL_DestroyTexture(texture); texture = NULL; texW = texH = 0; }
+    if (swsOut) { sws_freeContext(swsOut); swsOut = NULL; }
     if (frameLock) { SDL_DestroyMutex(frameLock); frameLock = NULL; }
     av_frame_free(&latched);
     window = NULL;
@@ -313,6 +315,44 @@ void MediaPresent(void) {
     if (shown) IHS_SessionReportVideoFrameComplete(statsSession, shownId, IHS_VideoFrameResultDisplayed);
 }
 
+/* Headless twin of MediaPresent: same latch, same frame accounting, but the
+ * picture lands in the caller's buffer instead of a texture. Converting under
+ * the lock stalls the decode thread for the duration, exactly as the texture
+ * upload already does.
+ * ponytail: swscale to XRGB8888 costs a full-frame pass per frame (~5 ms for
+ * 1080p on a Pi 5). Switch to libretro's GL hw_render with a YUV shader if that
+ * ever shows up in the frame budget. */
+bool MediaPullVideo(void *pixels, int pitch, int maxHeight, int *outW, int *outH) {
+    uint16_t shownId = 0;
+    bool shown = false;
+    SDL_LockMutex(frameLock);
+    if (frameDirty && latched && latched->width > 0 &&
+        latched->width * 4 <= pitch && latched->height <= maxHeight) {
+        *outW = latched->width;
+        *outH = latched->height;
+        if (framePending) IHS_SessionReportVideoFrameStage(statsSession, pendingFrameId,
+                                                           IHS_VideoFrameStageUploadBegin, 0);
+        swsOut = sws_getCachedContext(swsOut, latched->width, latched->height, latched->format,
+                                      latched->width, latched->height, AV_PIX_FMT_BGRA,
+                                      SWS_BILINEAR, NULL, NULL, NULL);
+        uint8_t *dst[4] = {pixels};
+        int dstLines[4] = {pitch};
+        sws_scale(swsOut, (const uint8_t *const *) latched->data, latched->linesize, 0,
+                  latched->height, dst, dstLines);
+        frameDirty = false;
+        shown = framePending;
+        shownId = pendingFrameId;
+        framePending = false;
+    }
+    SDL_UnlockMutex(frameLock);
+
+    if (shown) {
+        IHS_SessionReportVideoFrameStage(statsSession, shownId, IHS_VideoFrameStageUploadEnd, 0);
+        IHS_SessionReportVideoFrameComplete(statsSession, shownId, IHS_VideoFrameResultDisplayed);
+    }
+    return shown;
+}
+
 const IHS_StreamVideoCallbacks VideoCallbacks = {
         .start = VideoStart,
         .submit = VideoSubmit,
@@ -324,6 +364,12 @@ const IHS_StreamVideoCallbacks VideoCallbacks = {
 static int AudioStart(IHS_Session *session, const IHS_StreamAudioConfig *config, void *context) {
     (void) session; (void) context;
     if (!audioEnabled) return 0;
+    /* Headless callers hand the samples straight to libretro, which is stereo-only. */
+    if (!renderer && config->channels != 2) {
+        SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION, "%d audio channels, muting", (int) config->channels);
+        audioEnabled = false;
+        return 0;
+    }
     if (config->codec != IHS_StreamAudioCodecOpus) {
         SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION, "unsupported audio codec %d, muting", config->codec);
         audioEnabled = false;
@@ -347,11 +393,20 @@ static int AudioStart(IHS_Session *session, const IHS_StreamAudioConfig *config,
     av_opt_set_sample_fmt(swr, "out_sample_fmt", AV_SAMPLE_FMT_S16, 0);
     swr_init(swr);
 
+    /* Headless: a device-less SDL_AudioStream is just the queue, which is all
+     * MediaPullAudio needs — no second ring buffer to write and get wrong. */
     SDL_AudioSpec want = {SDL_AUDIO_S16, audioChannels, actx->sample_rate};
-    audioStream = SDL_OpenAudioDeviceStream(SDL_AUDIO_DEVICE_DEFAULT_PLAYBACK, &want, NULL, NULL);
+    audioStream = renderer ? SDL_OpenAudioDeviceStream(SDL_AUDIO_DEVICE_DEFAULT_PLAYBACK, &want, NULL, NULL)
+                           : SDL_CreateAudioStream(&want, &want);
     if (!audioStream) { audioEnabled = false; return 0; }
-    SDL_ResumeAudioStreamDevice(audioStream);
+    if (renderer) SDL_ResumeAudioStreamDevice(audioStream);
     return 0;
+}
+
+int MediaPullAudio(int16_t *out, int maxFrames) {
+    if (!audioEnabled || !audioStream) return 0;
+    int got = SDL_GetAudioStreamData(audioStream, out, maxFrames * audioChannels * (int) sizeof(int16_t));
+    return got > 0 ? got / (audioChannels * (int) sizeof(int16_t)) : 0;
 }
 
 static int AudioSubmit(IHS_Session *session, IHS_Buffer *data, void *context) {
