@@ -166,10 +166,39 @@ survive a rebase onto upstream:
 - **`platforms/ihs_udp_posix.c`** — 4 MB `SO_RCVBUF`; the ~208 KB default drops
   most of every keyframe burst.
 - **`client/streaming.c`** — `device_version = "1.1.0"`, without which the host
-  ignores our resolution/framerate/bitrate caps.
+  ignores our resolution/framerate/bitrate caps. Also reserves gamepad slots in
+  the streaming request (`IHS_StreamingRequest.gamepadCount`), the way Steam's
+  own client does, so the host sets the controllers up from the request instead
+  of only learning of them when the HID channel enumerates mid-negotiation.
+- **`session/channels/control/control_hid.c`** — never send a HID message before
+  the session is streaming. IHSlib gated outbound HID on `BStreamingInput()` but
+  not on `IsStreaming()` (both of which Steam checks). The HID manager enumerates
+  on the timer thread, so a slow handshake lets the device list race ahead of the
+  authentication request; the host accepts that early `RemoteHID` and then never
+  answers, and the session dies mid-negotiation. New `IHS_SessionStreaming()`
+  (`connectionState == Connected`) gates it. Surfaces from a libretro front-end,
+  where video init delays the handshake past the first HID tick.
+- **`session/channels/channel.c`** — a fragmented outgoing frame is now numbered
+  the way the receiving window reads it back. The head carried `size/limit + 1`
+  where the window expects `1 + head->fragmentId` fragments *after* the head (one
+  too many, two when the body divided evenly), and every fragment reused the
+  head's packet id where the window keys its slots by id. No fragmented control
+  message (e.g. a large `SetIcon`) was ever acknowledged; the control window then
+  overflowed and tore the session down.
+- **`session/packet.h` + `session/retransmission.c` + `ch_control.c`** — a
+  per-packet retransmit cap (a non-wire header field, default
+  `RETRANSMISSION_ATTEMPTS`), set to 3 for `k_EStreamControlRemoteHID`. HID input
+  is a full state snapshot; retransmitting a lost one 20 times (200 ms) head-of-
+  line-blocks every later input behind it — a ~1/min control freeze on lossy
+  Wi-Fi. Three tries (~30 ms) is enough before letting the channel advance; the
+  next report supersedes the lost one, and the host resyncs its sequence past the
+  gap as it already does on a full give-up. Steers only our retransmit policy, no
+  wire change.
 
 `ctest` covers the window and HID-report fixes; each test was verified to fail
-against the pre-fix code (the HID ones need ASan to trip).
+against the pre-fix code (the HID ones need ASan to trip). The fragment-numbering
+and retransmit-cap fixes are not yet covered — the send path has no seam to
+capture emitted packets.
 
 ## License
 
