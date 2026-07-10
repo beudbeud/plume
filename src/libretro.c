@@ -319,7 +319,11 @@ void retro_unload_game(void) {
         SDL_Quit();
         return;
     }
-    IHS_SessionDisconnect(g_session);
+    /* Only if the session is still up. The host's own Disconnect already ran
+     * IHS_SessionInterrupt, and a second disconnect queues a timer task the
+     * stopped worker never drains — IHS_SessionDestroy then fires it while
+     * tearing the timer down, and IHS_QueueAppend writes into freed memory. */
+    if (g_running) IHS_SessionDisconnect(g_session);
     IHS_SessionThreadedJoin(g_session);
     IHS_SessionDestroy(g_session); /* closes its devices, so destroy the provider after */
     IHS_HIDProviderSDLDestroy(g_hid);
