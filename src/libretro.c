@@ -131,6 +131,11 @@ static void OnConnected(IHS_Session *s, void *ctx) {
     (void) ctx;
     g_hid = IHS_HIDProviderSDLCreateManaged();
     IHS_SessionHIDAddProvider(s, g_hid);
+    /* AddProvider only registers it. The device list is announced on enumeration,
+     * which the SDL backend drives from GAMEPAD_ADDED events — and those fired
+     * before the session existed, since the pad was plugged in long ago. Ask for
+     * the enumeration ourselves, or the host never learns of any controller. */
+    IHS_SessionHIDNotifyDeviceChange(s);
 }
 
 /* IHSlib keeps the pointer, not a copy (session_pri.h: `const
