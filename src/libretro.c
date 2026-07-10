@@ -65,7 +65,7 @@ static const struct { const char *label; int w, h, kbps; } RES[] = {
         {"1080p", 1920, 1080, 15000},
 };
 static int g_width = 1280, g_height = 720, g_kbps = 10000;
-static bool g_audio = true, g_desktop = false, g_hevc = false;
+static bool g_audio = true, g_desktop = true, g_hevc = false;
 
 static void Log(enum retro_log_level level, const char *fmt, ...) {
     char msg[512];
@@ -81,7 +81,7 @@ static void Log(enum retro_log_level level, const char *fmt, ...) {
 static const struct retro_variable OPTIONS[] = {
         {"plume_resolution", "Resolution; 720p|1080p|480p|240p"},
         {"plume_audio",      "Audio; enabled|disabled"},
-        {"plume_desktop",    "Desktop mode; disabled|enabled"},
+        {"plume_desktop",    "Desktop mode; enabled|disabled"},
         {"plume_hevc",       "HEVC video; disabled|enabled"},
         {NULL, NULL},
 };
@@ -101,7 +101,9 @@ static void LoadOptions(void) {
         break;
     }
     g_audio = !OptionIs("plume_audio", "disabled");
-    g_desktop = OptionIs("plume_desktop", "enabled");
+    /* Same default as the client: a Linux host advertises no Big Picture session,
+     * and asking for one gets the stream torn down a few seconds in. */
+    g_desktop = !OptionIs("plume_desktop", "disabled");
     g_hevc = OptionIs("plume_hevc", "enabled");
 }
 
