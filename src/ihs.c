@@ -1,6 +1,6 @@
 /* Shared IHSlib plumbing — see ihs.h. Lifted verbatim out of main.c when the
  * libretro core needed the same discovery/pairing identity. */
-#define _DEFAULT_SOURCE  /* gethostname, mkdir */
+#define _GNU_SOURCE      /* gethostname, mkdir, dladdr, ucontext_t */
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -9,6 +9,8 @@
 
 #include <signal.h>
 #include <execinfo.h>
+#include <ucontext.h>
+#include <dlfcn.h>
 
 #include <SDL3/SDL.h>
 #include "ihs.h"
@@ -60,10 +62,36 @@ void PlumeInitCreds(void) {
     PlumeClientConfig = (IHS_ClientConfig) {g_deviceId, g_secretKey, g_deviceName};
 }
 
-static void OnFatalSignal(int sig) {
+/* Name an address as module+offset, which addr2line can turn back into a line. */
+static void PrintAddr(const char *label, void *addr) {
+    Dl_info info;
+    if (dladdr(addr, &info) && info.dli_fname) {
+        fprintf(stderr, "  %-4s %p  %s+0x%lx%s%s\n", label, addr, info.dli_fname,
+                (unsigned long) ((char *) addr - (char *) info.dli_fbase),
+                info.dli_sname ? " in " : "", info.dli_sname ? info.dli_sname : "");
+    } else {
+        fprintf(stderr, "  %-4s %p  (not in any mapped object)\n", label, addr);
+    }
+}
+
+static void OnFatalSignal(int sig, siginfo_t *si, void *uctx) {
+    fprintf(stderr, "\n*** fatal signal %d (%s) at %p\n", sig, strsignal(sig), si->si_addr);
+
+    /* backtrace() walks frame pointers, so it gives up the moment a bad call
+     * lands somewhere without a frame. The register file always knows: pc is
+     * where we jumped, lr is who jumped there. */
+#if defined(__aarch64__)
+    mcontext_t *mc = &((ucontext_t *) uctx)->uc_mcontext;
+    PrintAddr("pc", (void *) mc->pc);
+    PrintAddr("lr", (void *) mc->regs[30]);
+#elif defined(__x86_64__)
+    mcontext_t *mc = &((ucontext_t *) uctx)->uc_mcontext;
+    PrintAddr("pc", (void *) mc->gregs[REG_RIP]);
+#endif
+
     void *frames[32];
     int n = backtrace(frames, 32);
-    fprintf(stderr, "\n*** fatal signal %d (%s), %d frames:\n", sig, strsignal(sig), n);
+    fprintf(stderr, "  %d frames:\n", n);
     fflush(stderr);
     backtrace_symbols_fd(frames, n, STDERR_FILENO);
     signal(sig, SIG_DFL);
@@ -71,9 +99,12 @@ static void OnFatalSignal(int sig) {
 }
 
 void PlumeInstallCrashHandler(void) {
-    signal(SIGSEGV, OnFatalSignal);
-    signal(SIGABRT, OnFatalSignal);
-    signal(SIGBUS, OnFatalSignal);
+    struct sigaction sa = {0};
+    sa.sa_sigaction = OnFatalSignal;
+    sa.sa_flags = SA_SIGINFO;
+    sigaction(SIGSEGV, &sa, NULL);
+    sigaction(SIGABRT, &sa, NULL);
+    sigaction(SIGBUS, &sa, NULL);
 }
 
 void PlumeLog(IHS_LogLevel level, const char *tag, const char *message) {
