@@ -70,6 +70,11 @@ static const struct { const char *label; int w, h, fps, kbps; } RES[] = {
 };
 static int g_width = 1280, g_height = 720, g_fps = 60, g_kbps = 10000;
 static bool g_audio = true, g_desktop = true, g_hevc = false;
+/* Off by default: forwarding mouse movement drifts the host cursor, and a host
+ * running focus-follows-mouse (i3 and friends) then switches the focused window
+ * away from the game — the capture follows, and you get the desktop. A pad core
+ * has no business moving the host mouse unless someone asks for it. */
+static bool g_mouse = false;
 
 static void Log(enum retro_log_level level, const char *fmt, ...) {
     char msg[512];
@@ -87,6 +92,7 @@ static const struct retro_variable OPTIONS[] = {
         {"plume_audio",      "Audio; enabled|disabled"},
         {"plume_desktop",    "Desktop mode; enabled|disabled"},
         {"plume_hevc",       "HEVC video; disabled|enabled"},
+        {"plume_mouse",      "Forward mouse; disabled|enabled"},
         {NULL, NULL},
 };
 
@@ -110,6 +116,7 @@ static void LoadOptions(void) {
      * and asking for one gets the stream torn down a few seconds in. */
     g_desktop = !OptionIs("plume_desktop", "disabled");
     g_hevc = OptionIs("plume_hevc", "enabled");
+    g_mouse = OptionIs("plume_mouse", "enabled");
 }
 
 /* ------------------------------- session ---------------------------------- */
@@ -392,7 +399,7 @@ void retro_run(void) {
     if (hidDirty) IHS_SessionHIDSendReport(g_session);
 
     input_poll_cb();
-    ForwardMouse();
+    if (g_mouse) ForwardMouse();
 
     if (MediaPullVideo(g_frame, MAX_W * (int) sizeof(*g_frame), g_width, g_height)) {
         video_cb(g_frame, g_width, g_height, MAX_W * sizeof(*g_frame));
