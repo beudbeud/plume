@@ -39,7 +39,6 @@ static retro_input_state_t input_state_cb;
 static retro_log_printf_t log_cb;
 
 static uint32_t *g_frame;          /* XRGB8888, MAX_W * MAX_H */
-static int g_frameW = 1280, g_frameH = 720;
 static IHS_Session *g_session;
 static IHS_HIDProvider *g_hid;
 static volatile bool g_running;
@@ -58,13 +57,18 @@ static int g_pairTicks;
 /* Negotiated caps, from the core options. Bitrate follows the resolution, same
  * table as the launcher's menu (ui.c): a 240p stream on a narrow wifi link is
  * pointless if we still let the host spend 15 Mbps on it. */
-static const struct { const char *label; int w, h, kbps; } RES[] = {
-        {"240p",  426,  240,  3000},
-        {"480p",  854,  480,  6000},
-        {"720p",  1280, 720,  10000},
-        {"1080p", 1920, 1080, 15000},
+static const struct { const char *label; int w, h, fps, kbps; } RES[] = {
+        {"240p",    426,  240,  60, 3000},
+        {"480p",    854,  480,  60, 6000},
+        {"720p",    1280, 720,  60, 10000},
+        {"1080p",   1920, 1080, 60, 15000},
+        /* CRT modes. 15 kHz cannot scan 480 progressive lines at 60 Hz, so RetroArch
+         * asks switchres for the interlaced mode — but only if we hold a standard
+         * geometry still. 576 lines is PAL, hence 50 Hz. */
+        {"720x480", 720,  480,  60, 6000},
+        {"768x576", 768,  576,  50, 6000},
 };
-static int g_width = 1280, g_height = 720, g_kbps = 10000;
+static int g_width = 1280, g_height = 720, g_fps = 60, g_kbps = 10000;
 static bool g_audio = true, g_desktop = true, g_hevc = false;
 
 static void Log(enum retro_log_level level, const char *fmt, ...) {
@@ -79,7 +83,7 @@ static void Log(enum retro_log_level level, const char *fmt, ...) {
 
 /* ------------------------------ core options ------------------------------ */
 static const struct retro_variable OPTIONS[] = {
-        {"plume_resolution", "Resolution; 720p|1080p|480p|240p"},
+        {"plume_resolution", "Resolution; 720p|1080p|480p|240p|720x480|768x576"},
         {"plume_audio",      "Audio; enabled|disabled"},
         {"plume_desktop",    "Desktop mode; enabled|disabled"},
         {"plume_hevc",       "HEVC video; disabled|enabled"},
@@ -97,6 +101,7 @@ static void LoadOptions(void) {
         if (!OptionIs("plume_resolution", RES[i].label)) continue;
         g_width = RES[i].w;
         g_height = RES[i].h;
+        g_fps = RES[i].fps;
         g_kbps = RES[i].kbps;
         break;
     }
@@ -114,7 +119,7 @@ static void OnConfiguring(IHS_Session *s, IHS_SessionConfig *cfg, void *ctx) {
     cfg->enableHevc = g_hevc;
     cfg->maxWidth = g_width;
     cfg->maxHeight = g_height;
-    cfg->maxFps = 60;
+    cfg->maxFps = g_fps;
     cfg->maxBitrateKbps = g_kbps;
 }
 
@@ -200,12 +205,15 @@ void retro_get_system_info(struct retro_system_info *info) {
 
 void retro_get_system_av_info(struct retro_system_av_info *info) {
     memset(info, 0, sizeof(*info));
-    info->geometry.base_width = g_frameW;
-    info->geometry.base_height = g_frameH;
-    info->geometry.max_width = MAX_W;
-    info->geometry.max_height = MAX_H;
+    /* Fixed for the whole run. media.c letterboxes the host's changing aspect
+     * ratio into it, so the frontend never has to re-fit — which on a CRT means
+     * switchres picks one mode and keeps it. */
+    info->geometry.base_width = g_width;
+    info->geometry.base_height = g_height;
+    info->geometry.max_width = g_width;
+    info->geometry.max_height = g_height;
     info->geometry.aspect_ratio = 0.0f; /* base_width / base_height */
-    info->timing.fps = 60.0;
+    info->timing.fps = g_fps;
     info->timing.sample_rate = AUDIO_RATE;
 }
 
@@ -267,8 +275,6 @@ bool retro_load_game(const struct retro_game_info *info) {
     if (environ_cb(RETRO_ENVIRONMENT_GET_LOG_INTERFACE, &logging)) log_cb = logging.log;
 
     LoadOptions();
-    g_frameW = g_width;
-    g_frameH = g_height;
 
     /* The HID provider opens the gamepads; RetroArch keeps reading them too. */
     if (!SDL_Init(SDL_INIT_GAMEPAD)) {
@@ -351,7 +357,7 @@ static void PairTick(void) {
         struct retro_message m = {msg, 130}; /* outlast the gap to the next one */
         environ_cb(RETRO_ENVIRONMENT_SET_MESSAGE, &m);
     }
-    video_cb(g_frame, g_frameW, g_frameH, MAX_W * sizeof(*g_frame)); /* still the calloc'd black */
+    video_cb(g_frame, g_width, g_height, MAX_W * sizeof(*g_frame)); /* still the calloc'd black */
 
     if (!g_pairing.done) {
         if (++g_pairTicks < PAIR_TIMEOUT_TICKS) return;
@@ -388,18 +394,10 @@ void retro_run(void) {
     input_poll_cb();
     ForwardMouse();
 
-    int w = g_frameW, h = g_frameH;
-    if (MediaPullVideo(g_frame, MAX_W * (int) sizeof(*g_frame), MAX_H, &w, &h)) {
-        if (w != g_frameW || h != g_frameH) {
-            g_frameW = w;
-            g_frameH = h;
-            struct retro_game_geometry geom = {.base_width = w, .base_height = h,
-                                               .max_width = MAX_W, .max_height = MAX_H};
-            environ_cb(RETRO_ENVIRONMENT_SET_GEOMETRY, &geom);
-        }
-        video_cb(g_frame, w, h, MAX_W * sizeof(*g_frame));
+    if (MediaPullVideo(g_frame, MAX_W * (int) sizeof(*g_frame), g_width, g_height)) {
+        video_cb(g_frame, g_width, g_height, MAX_W * sizeof(*g_frame));
     } else {
-        video_cb(NULL, g_frameW, g_frameH, MAX_W * sizeof(*g_frame)); /* nothing new: dup */
+        video_cb(NULL, g_width, g_height, MAX_W * sizeof(*g_frame)); /* nothing new: dup */
     }
 
     /* One Opus packet is at most 120 ms; a 60 Hz tick drains ~800 frames. */

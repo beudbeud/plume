@@ -316,26 +316,41 @@ void MediaPresent(void) {
 }
 
 /* Headless twin of MediaPresent: same latch, same frame accounting, but the
- * picture lands in the caller's buffer instead of a texture. Converting under
- * the lock stalls the decode thread for the duration, exactly as the texture
- * upload already does.
+ * picture lands in the caller's buffer, scaled to a fixed dstW x dstH with black
+ * bars. Converting under the lock stalls the decode thread for the duration,
+ * exactly as the texture upload already does.
+ * ponytail: MEDIA_SCALE_CROP falls back to fit; it needs source cropping.
  * ponytail: swscale to XRGB8888 costs a full-frame pass per frame (~5 ms for
  * 1080p on a Pi 5). Switch to libretro's GL hw_render with a YUV shader if that
  * ever shows up in the frame budget. */
-bool MediaPullVideo(void *pixels, int pitch, int maxHeight, int *outW, int *outH) {
+bool MediaPullVideo(void *pixels, int pitch, int dstW, int dstH) {
+    /* Last letterbox rect, so the bars are cleared once instead of every frame. */
+    static int barW, barH;
     uint16_t shownId = 0;
     bool shown = false;
     SDL_LockMutex(frameLock);
-    if (frameDirty && latched && latched->width > 0 &&
-        latched->width * 4 <= pitch && latched->height <= maxHeight) {
-        *outW = latched->width;
-        *outH = latched->height;
+    if (frameDirty && latched && latched->width > 0) {
+        int w = dstW, h = dstH, x = 0, y = 0;
+        if (scaleMode != MEDIA_SCALE_STRETCH) {
+            /* The host streams its own aspect ratio inside the box we asked for, and
+             * it changes it whenever the captured window does. Scale to fit here so
+             * the frontend always sees one fixed geometry. */
+            float scale = SDL_min((float) dstW / latched->width, (float) dstH / latched->height);
+            w = (int) (latched->width * scale) & ~1; /* even: chroma is subsampled */
+            h = (int) (latched->height * scale) & ~1;
+            x = (dstW - w) / 2;
+            y = (dstH - h) / 2;
+        }
+        if (w != barW || h != barH) {
+            memset(pixels, 0, (size_t) dstH * pitch); /* new bars, paint them black once */
+            barW = w;
+            barH = h;
+        }
         if (framePending) IHS_SessionReportVideoFrameStage(statsSession, pendingFrameId,
                                                            IHS_VideoFrameStageUploadBegin, 0);
         swsOut = sws_getCachedContext(swsOut, latched->width, latched->height, latched->format,
-                                      latched->width, latched->height, AV_PIX_FMT_BGRA,
-                                      SWS_BILINEAR, NULL, NULL, NULL);
-        uint8_t *dst[4] = {pixels};
+                                      w, h, AV_PIX_FMT_BGRA, SWS_BILINEAR, NULL, NULL, NULL);
+        uint8_t *dst[4] = {(uint8_t *) pixels + (size_t) y * pitch + (size_t) x * 4};
         int dstLines[4] = {pitch};
         sws_scale(swsOut, (const uint8_t *const *) latched->data, latched->linesize, 0,
                   latched->height, dst, dstLines);
