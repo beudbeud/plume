@@ -57,10 +57,36 @@ endif()
 # libretro core: same decode and session code, no window of its own. RetroArch
 # takes the frames and samples; SDL is still here for the gamepad->HID bridge.
 option(PLUME_LIBRETRO "Build the libretro core" OFF)
+
+# A libretro frontend dlopens the core into a symbol scope it already dominates,
+# and RetroArch is linked against libSDL2. SDL2 exports unversioned `SDL_Init`,
+# which glibc happily binds to our `SDL_Init@SDL3_0.0.0` reference (dl-lookup.c
+# accepts an unversioned definition when the Verneed entry names another file).
+# SDL2 then returns 0 for success where SDL3 returns false — every SDL call in
+# the core lands in the wrong library. Link SDL3 in and hide it: --exclude-libs
+# makes the archive's symbols local, so they bind at link time, past any scope.
+option(PLUME_LIBRETRO_STATIC_SDL "Link SDL3 into the core and hide its symbols" ON)
+
 if(PLUME_LIBRETRO)
     add_library(plume_libretro SHARED src/libretro.c src/media.c src/ihs.c)
     set_target_properties(plume_libretro PROPERTIES PREFIX "")
     target_include_directories(plume_libretro PRIVATE external ${SDL3_INCLUDE_DIRS} ${FFMPEG_INCLUDE_DIRS})
-    target_link_libraries(plume_libretro PRIVATE ihslib ihslib-hid-sdl ${SDL3_LIBRARIES} ${FFMPEG_LIBRARIES})
     target_compile_options(plume_libretro PRIVATE ${SDL3_CFLAGS_OTHER} ${FFMPEG_CFLAGS_OTHER})
+
+    if(PLUME_LIBRETRO_STATIC_SDL)
+        set(_suffixes ${CMAKE_FIND_LIBRARY_SUFFIXES})
+        set(CMAKE_FIND_LIBRARY_SUFFIXES .a)
+        find_library(SDL3_STATIC_LIB NAMES SDL3 HINTS ${SDL3_LIBRARY_DIRS} REQUIRED
+                DOC "libSDL3.a — build SDL3 with -DSDL_STATIC=ON")
+        set(CMAKE_FIND_LIBRARY_SUFFIXES ${_suffixes})
+        # Whatever SDL3 itself needs (udev, alsa, pthread...), minus SDL3.
+        set(_sdl_deps ${SDL3_STATIC_LIBRARIES})
+        list(REMOVE_ITEM _sdl_deps SDL3)
+        set(PLUME_SDL_LIBS ${SDL3_STATIC_LIB} ${_sdl_deps})
+        target_link_options(plume_libretro PRIVATE -Wl,--exclude-libs,ALL)
+    else()
+        set(PLUME_SDL_LIBS ${SDL3_LIBRARIES})
+    endif()
+
+    target_link_libraries(plume_libretro PRIVATE ihslib ihslib-hid-sdl ${PLUME_SDL_LIBS} ${FFMPEG_LIBRARIES})
 endif()
