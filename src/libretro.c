@@ -215,19 +215,13 @@ static bool ReadHostIp(const char *path, char *out, size_t n) {
     return out[0] != '\0';
 }
 
-/* Requests the stream (again, after a pairing) and brings the session up. */
-static bool StartSession(void) {
-    IHS_SessionInfo sinfo;
-    IHS_StreamingResult res;
-    if (!PlumeRequestStream(&g_host, g_width, g_height, g_desktop, &sinfo, &res)) {
-        Log(RETRO_LOG_ERROR, "%s refused the stream (result=%d)", g_host.hostname, res);
-        return false;
-    }
-
+/* Brings the session up on an already-granted streaming request. The host
+ * allocates a session per request, so it must be asked exactly once. */
+static bool StartSession(const IHS_SessionInfo *sinfo) {
     MediaAttach(NULL, NULL, g_audio, MEDIA_SCALE_FIT); /* headless: RetroArch scales */
 
     g_running = true;
-    g_session = IHS_SessionCreate(&PlumeClientConfig, &sinfo);
+    g_session = IHS_SessionCreate(&PlumeClientConfig, sinfo);
     IHS_SessionSetLogFunction(g_session, PlumeLog);
     IHS_SessionSetSessionCallbacks(g_session, &SESSION_CALLBACKS, NULL);
     IHS_SessionSetVideoCallbacks(g_session, &VideoCallbacks, NULL);
@@ -296,7 +290,7 @@ bool retro_load_game(const struct retro_game_info *info) {
         return true;
     }
 
-    return StartSession();
+    return StartSession(&sinfo);
 
 fail:
     IHS_Quit();
@@ -349,7 +343,11 @@ static void PairTick(void) {
         Log(RETRO_LOG_ERROR, "Pairing timed out");
     } else if (PlumePairFinish(&g_pairing)) {
         g_pairTicks = 0;
-        if (StartSession()) return; /* g_state is now ST_STREAM */
+        IHS_SessionInfo sinfo;
+        if (PlumeRequestStream(&g_host, g_width, g_height, g_desktop, &sinfo, NULL) &&
+            StartSession(&sinfo)) {
+            return; /* g_state is now ST_STREAM */
+        }
         environ_cb(RETRO_ENVIRONMENT_SHUTDOWN, NULL);
         return;
     }
