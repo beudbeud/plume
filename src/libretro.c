@@ -118,6 +118,15 @@ static void OnConfiguring(IHS_Session *s, IHS_SessionConfig *cfg, void *ctx) {
 
 static void OnDisconnected(IHS_Session *s, void *ctx) { (void) s; (void) ctx; g_running = false; }
 
+/* IHSlib keeps the pointer, not a copy (session_pri.h: `const
+ * IHS_StreamSessionCallbacks *session`), and calls configuring() from its worker
+ * thread once negotiation starts — long after whoever set it has returned. A
+ * local would be a dead stack frame by then. */
+static const IHS_StreamSessionCallbacks SESSION_CALLBACKS = {
+        .configuring = OnConfiguring,
+        .disconnected = OnDisconnected,
+};
+
 /* ------------------------------- input ------------------------------------ */
 /* Only mouse and gamepad. Keyboard would need RETROK_* -> USB HID usage, and
  * the pads are what a RetroArch user has in their hands.
@@ -216,10 +225,9 @@ static bool StartSession(void) {
     MediaAttach(NULL, NULL, g_audio, MEDIA_SCALE_FIT); /* headless: RetroArch scales */
 
     g_running = true;
-    IHS_StreamSessionCallbacks scb = {.configuring = OnConfiguring, .disconnected = OnDisconnected};
     g_session = IHS_SessionCreate(&PlumeClientConfig, &sinfo);
     IHS_SessionSetLogFunction(g_session, PlumeLog);
-    IHS_SessionSetSessionCallbacks(g_session, &scb, NULL);
+    IHS_SessionSetSessionCallbacks(g_session, &SESSION_CALLBACKS, NULL);
     IHS_SessionSetVideoCallbacks(g_session, &VideoCallbacks, NULL);
     IHS_SessionSetAudioCallbacks(g_session, &AudioCallbacks, NULL);
     g_hid = IHS_HIDProviderSDLCreateManaged();
