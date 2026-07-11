@@ -30,12 +30,12 @@ static struct SwsContext *sws;
 static struct SwsContext *swsOut;             /* headless: YUV -> XRGB8888 for the caller */
 static SDL_Mutex *frameLock;
 static AVFrame *latched; /* newest decoded frame; a ref into the decoder's pool, no copy */
+static AVFrame *consumed; /* the frame being shown; consumer thread only, never locked */
 static bool frameDirty;
 /* The host's adaptive bitrate loop runs on what we report per frame, so the latch
  * tracks which frame is waiting: replacing an unshown one is a real dropped frame. */
 static IHS_Session *statsSession;
 static uint16_t pendingFrameId;
-static bool framePending;
 
 static MediaScale scaleMode;
 
@@ -52,19 +52,20 @@ void MediaAttach(SDL_Window *w, SDL_Renderer *r, bool enableAudio, MediaScale sc
     audioEnabled = enableAudio;
     scaleMode = scale;
     statsSession = NULL;
-    framePending = false;
     frameLock = SDL_CreateMutex();
     latched = av_frame_alloc();
+    consumed = av_frame_alloc();
     frameDirty = false;
 }
 
 void MediaDetach(void) {
     statsSession = NULL; /* the session is being torn down; never report into it */
-    framePending = false;
+    frameDirty = false;
     if (texture) { SDL_DestroyTexture(texture); texture = NULL; texW = texH = 0; }
     if (swsOut) { sws_freeContext(swsOut); swsOut = NULL; }
     if (frameLock) { SDL_DestroyMutex(frameLock); frameLock = NULL; }
     av_frame_free(&latched);
+    av_frame_free(&consumed);
     window = NULL;
     renderer = NULL;
 }
@@ -167,16 +168,35 @@ static void StashFrame(AVFrame *src, uint16_t frameId) {
     av_frame_unref(latched);
     av_frame_move_ref(latched, src);
     /* A frame still waiting when the next one lands was never shown. */
-    bool hadPending = framePending;
+    bool hadPending = frameDirty;
     uint16_t dropped = pendingFrameId;
     pendingFrameId = frameId;
-    framePending = true;
     frameDirty = true;
     SDL_UnlockMutex(frameLock);
 
     if (hadPending) {
         IHS_SessionReportVideoFrameComplete(statsSession, dropped, IHS_VideoFrameResultDroppedLate);
     }
+}
+
+/* Move the newest frame out of the latch, so the conversion that follows — a
+ * swscale pass, or a texture upload — runs unlocked. Held, it would stall the
+ * decode thread in StashFrame for the whole of it: ~5 ms per frame at 1080p on a
+ * Pi 5, on a thread that also has to keep audio fed. Costs the decoder's pool one
+ * extra in-flight frame, not a copy. Consumer thread only. */
+static AVFrame *TakeFrame(uint16_t *frameId) {
+    SDL_LockMutex(frameLock);
+    if (!frameDirty || !latched || latched->width <= 0) {
+        SDL_UnlockMutex(frameLock);
+        return NULL;
+    }
+    av_frame_unref(consumed);
+    av_frame_move_ref(consumed, latched);
+    *frameId = pendingFrameId;
+    frameDirty = false;
+    SDL_UnlockMutex(frameLock);
+    IHS_SessionReportVideoFrameStage(statsSession, *frameId, IHS_VideoFrameStageUploadBegin, 0);
+    return consumed;
 }
 
 static IHS_StreamVideoSubmitResult VideoSubmit(IHS_Session *session, uint16_t frameId, IHS_Buffer *data,
@@ -258,37 +278,28 @@ static void VideoStop(IHS_Session *session, void *context) {
 
 void MediaPresent(void) {
     uint16_t shownId = 0;
-    bool shown = false;
-    SDL_LockMutex(frameLock);
-    if (frameDirty && latched && latched->width > 0) {
-        SDL_PixelFormat fmt = latched->format == AV_PIX_FMT_NV12 ? SDL_PIXELFORMAT_NV12
-                                                                 : SDL_PIXELFORMAT_IYUV;
-        if (!texture || texW != latched->width || texH != latched->height || texFmt != fmt) {
+    AVFrame *f = TakeFrame(&shownId);
+    if (f) {
+        SDL_PixelFormat fmt = f->format == AV_PIX_FMT_NV12 ? SDL_PIXELFORMAT_NV12
+                                                           : SDL_PIXELFORMAT_IYUV;
+        if (!texture || texW != f->width || texH != f->height || texFmt != fmt) {
             if (texture) SDL_DestroyTexture(texture);
             texture = SDL_CreateTexture(renderer, fmt, SDL_TEXTUREACCESS_STREAMING,
-                                        latched->width, latched->height);
-            texW = latched->width; texH = latched->height; texFmt = fmt;
+                                        f->width, f->height);
+            texW = f->width; texH = f->height; texFmt = fmt;
         }
-        if (framePending) IHS_SessionReportVideoFrameStage(statsSession, pendingFrameId,
-                                                           IHS_VideoFrameStageUploadBegin, 0);
         if (fmt == SDL_PIXELFORMAT_NV12) {
             SDL_UpdateNVTexture(texture, NULL,
-                                latched->data[0], latched->linesize[0],
-                                latched->data[1], latched->linesize[1]);
+                                f->data[0], f->linesize[0],
+                                f->data[1], f->linesize[1]);
         } else {
             SDL_UpdateYUVTexture(texture, NULL,
-                                 latched->data[0], latched->linesize[0],
-                                 latched->data[1], latched->linesize[1],
-                                 latched->data[2], latched->linesize[2]);
+                                 f->data[0], f->linesize[0],
+                                 f->data[1], f->linesize[1],
+                                 f->data[2], f->linesize[2]);
         }
-        frameDirty = false;
-        shown = framePending;
-        shownId = pendingFrameId;
-        framePending = false;
+        IHS_SessionReportVideoFrameStage(statsSession, shownId, IHS_VideoFrameStageUploadEnd, 0);
     }
-    SDL_UnlockMutex(frameLock);
-
-    if (shown) IHS_SessionReportVideoFrameStage(statsSession, shownId, IHS_VideoFrameStageUploadEnd, 0);
 
     SDL_RenderClear(renderer);
     if (texture) {
@@ -312,13 +323,12 @@ void MediaPresent(void) {
 
     /* Reported after present: this is the cursor the 1 Hz stats flush walks, and
      * it's what tells the host our end of the pipeline kept up. */
-    if (shown) IHS_SessionReportVideoFrameComplete(statsSession, shownId, IHS_VideoFrameResultDisplayed);
+    if (f) IHS_SessionReportVideoFrameComplete(statsSession, shownId, IHS_VideoFrameResultDisplayed);
 }
 
 /* Headless twin of MediaPresent: same latch, same frame accounting, but the
  * picture lands in the caller's buffer, scaled to a fixed dstW x dstH with black
- * bars. Converting under the lock stalls the decode thread for the duration,
- * exactly as the texture upload already does.
+ * bars.
  * ponytail: MEDIA_SCALE_CROP falls back to fit; it needs source cropping.
  * ponytail: swscale to XRGB8888 costs a full-frame pass per frame (~5 ms for
  * 1080p on a Pi 5). Switch to libretro's GL hw_render with a YUV shader if that
@@ -327,45 +337,34 @@ bool MediaPullVideo(void *pixels, int pitch, int dstW, int dstH) {
     /* Last letterbox rect, so the bars are cleared once instead of every frame. */
     static int barW, barH;
     uint16_t shownId = 0;
-    bool shown = false;
-    SDL_LockMutex(frameLock);
-    if (frameDirty && latched && latched->width > 0) {
-        int w = dstW, h = dstH, x = 0, y = 0;
-        if (scaleMode != MEDIA_SCALE_STRETCH) {
-            /* The host streams its own aspect ratio inside the box we asked for, and
-             * it changes it whenever the captured window does. Scale to fit here so
-             * the frontend always sees one fixed geometry. */
-            float scale = SDL_min((float) dstW / latched->width, (float) dstH / latched->height);
-            w = (int) (latched->width * scale) & ~1; /* even: chroma is subsampled */
-            h = (int) (latched->height * scale) & ~1;
-            x = (dstW - w) / 2;
-            y = (dstH - h) / 2;
-        }
-        if (w != barW || h != barH) {
-            memset(pixels, 0, (size_t) dstH * pitch); /* new bars, paint them black once */
-            barW = w;
-            barH = h;
-        }
-        if (framePending) IHS_SessionReportVideoFrameStage(statsSession, pendingFrameId,
-                                                           IHS_VideoFrameStageUploadBegin, 0);
-        swsOut = sws_getCachedContext(swsOut, latched->width, latched->height, latched->format,
-                                      w, h, AV_PIX_FMT_BGRA, SWS_BILINEAR, NULL, NULL, NULL);
-        uint8_t *dst[4] = {(uint8_t *) pixels + (size_t) y * pitch + (size_t) x * 4};
-        int dstLines[4] = {pitch};
-        sws_scale(swsOut, (const uint8_t *const *) latched->data, latched->linesize, 0,
-                  latched->height, dst, dstLines);
-        frameDirty = false;
-        shown = framePending;
-        shownId = pendingFrameId;
-        framePending = false;
-    }
-    SDL_UnlockMutex(frameLock);
+    AVFrame *f = TakeFrame(&shownId);
+    if (!f) return false;
 
-    if (shown) {
-        IHS_SessionReportVideoFrameStage(statsSession, shownId, IHS_VideoFrameStageUploadEnd, 0);
-        IHS_SessionReportVideoFrameComplete(statsSession, shownId, IHS_VideoFrameResultDisplayed);
+    int w = dstW, h = dstH, x = 0, y = 0;
+    if (scaleMode != MEDIA_SCALE_STRETCH) {
+        /* The host streams its own aspect ratio inside the box we asked for, and
+         * it changes it whenever the captured window does. Scale to fit here so
+         * the frontend always sees one fixed geometry. */
+        float scale = SDL_min((float) dstW / f->width, (float) dstH / f->height);
+        w = (int) (f->width * scale) & ~1; /* even: chroma is subsampled */
+        h = (int) (f->height * scale) & ~1;
+        x = (dstW - w) / 2;
+        y = (dstH - h) / 2;
     }
-    return shown;
+    if (w != barW || h != barH) {
+        memset(pixels, 0, (size_t) dstH * pitch); /* new bars, paint them black once */
+        barW = w;
+        barH = h;
+    }
+    swsOut = sws_getCachedContext(swsOut, f->width, f->height, f->format,
+                                  w, h, AV_PIX_FMT_BGRA, SWS_BILINEAR, NULL, NULL, NULL);
+    uint8_t *dst[4] = {(uint8_t *) pixels + (size_t) y * pitch + (size_t) x * 4};
+    int dstLines[4] = {pitch};
+    sws_scale(swsOut, (const uint8_t *const *) f->data, f->linesize, 0, f->height, dst, dstLines);
+
+    IHS_SessionReportVideoFrameStage(statsSession, shownId, IHS_VideoFrameStageUploadEnd, 0);
+    IHS_SessionReportVideoFrameComplete(statsSession, shownId, IHS_VideoFrameResultDisplayed);
+    return true;
 }
 
 const IHS_StreamVideoCallbacks VideoCallbacks = {
