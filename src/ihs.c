@@ -5,7 +5,9 @@
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
+#include <fcntl.h>
 #include <sys/stat.h>
+#include <sys/random.h>
 
 #include <signal.h>
 #include <execinfo.h>
@@ -26,6 +28,13 @@ void PlumeDataPath(char *out, size_t n, const char *name) {
     const char *home = getenv("HOME");
     if (!home) home = ".";
     char dir[400];
+    /* Parents too: if ~/.local/share doesn't exist yet, the leaf mkdir fails
+     * ENOENT, creds.bin is silently never written, and every launch is a fresh
+     * identity the user has to re-pair. */
+    snprintf(dir, sizeof(dir), "%s/.local", home);
+    mkdir(dir, 0755);
+    snprintf(dir, sizeof(dir), "%s/.local/share", home);
+    mkdir(dir, 0755);
     snprintf(dir, sizeof(dir), "%s/.local/share/plume", home);
     if (mkdir(dir, 0700) == 0) {
         /* We just created it, so this is the first run since the project was
@@ -48,14 +57,18 @@ void PlumeInitCreds(void) {
         fclose(f);
     } else {
         if (f) fclose(f);
-        FILE *r = fopen("/dev/urandom", "rb");
-        if (!r || fread(&g_deviceId, 8, 1, r) != 1 || fread(g_secretKey, 32, 1, r) != 1) {
-            fprintf(stderr, "cannot read /dev/urandom\n");
+        /* getrandom over /dev/urandom: no device node needed (containers), and no
+         * short-read-means-zero-key failure mode to mishandle. */
+        if (getrandom(&g_deviceId, 8, 0) != 8 || getrandom(g_secretKey, 32, 0) != 32) {
+            fprintf(stderr, "getrandom failed\n");
             exit(1);
         }
-        fclose(r);
-        FILE *w = fopen(path, "wb");
+        /* 0600: this key is what the host trusts after pairing. The directory is
+         * already 0700, but the file shouldn't rely on it. */
+        int fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0600);
+        FILE *w = fd >= 0 ? fdopen(fd, "wb") : NULL;
         if (w) { fwrite(&g_deviceId, 8, 1, w); fwrite(g_secretKey, 32, 1, w); fclose(w); }
+        else if (fd >= 0) close(fd);
     }
     if (gethostname(g_deviceName, sizeof(g_deviceName)) != 0)
         strcpy(g_deviceName, "plume");
@@ -105,6 +118,30 @@ void PlumeInstallCrashHandler(void) {
     sigaction(SIGSEGV, &sa, NULL);
     sigaction(SIGABRT, &sa, NULL);
     sigaction(SIGBUS, &sa, NULL);
+}
+
+/* The last two are CRT modes: 15 kHz cannot scan 480 progressive lines at 60 Hz,
+ * so RetroArch asks switchres for the interlaced mode — but only if the geometry
+ * holds still. 576 lines is PAL, hence 50 Hz rather than 60. */
+const PlumeRes PlumeResList[] = {
+        {"240p",    426,  240,  60, 3000},
+        {"480p",    854,  480,  60, 6000},
+        {"720p",    1280, 720,  60, 10000},
+        {"1080p",   1920, 1080, 60, 15000},
+        {"720x480", 720,  480,  60, 6000},
+        {"768x576", 768,  576,  50, 6000},
+};
+const int PlumeResCount = (int) (sizeof(PlumeResList) / sizeof(PlumeResList[0]));
+
+int PlumeResIndex(int w, int h) {
+    for (int i = 0; i < PlumeResCount; i++) {
+        /* Width too: 720x480 and 480p share a height. */
+        if (PlumeResList[i].w == w && PlumeResList[i].h == h) return i;
+    }
+    for (int i = 0; i < PlumeResCount; i++) {
+        if (PlumeResList[i].w == 1920) return i;
+    }
+    return 0;
 }
 
 int PlumeCountGamepads(void) {
@@ -176,11 +213,12 @@ static void OnAuthFailed(IHS_Client *c, const IHS_HostInfo *h, IHS_Authorization
 static void OnAuthProgress(IHS_Client *c, const IHS_HostInfo *h, void *ctx) { (void)c;(void)h;(void)ctx; }
 
 void PlumeMakePin(char pin[5]) {
-    uint32_t r = 0;
-    FILE *ur = fopen("/dev/urandom", "rb");
-    if (ur) {
-        if (fread(&r, sizeof(r), 1, ur) != 1) r = 0;
-        fclose(ur);
+    uint32_t r;
+    /* Hard failure over a fallback: every silent fallback here has meant PIN 0000
+     * — zero entropy on the one secret gating the pairing. */
+    if (getrandom(&r, sizeof(r), 0) != sizeof(r)) {
+        fprintf(stderr, "getrandom failed\n");
+        exit(1);
     }
     snprintf(pin, 5, "%04u", r % 10000);
 }
@@ -217,6 +255,17 @@ static void OnStreamSuccess(IHS_Client *c, const IHS_HostInfo *h, const IHS_Sock
                             const uint8_t *key, size_t keyLen, void *ctx) {
     (void) h;
     StreamReq *s = ctx;
+    /* keyLen comes off the wire: IHSlib decrypts up to 128 bytes and hands us the
+     * length as-is, but sessionKey holds 32. Anything bigger would memcpy over
+     * sessionKeyLen, steamId and the stack past this struct. */
+    if (keyLen > sizeof(s->info.sessionKey)) {
+        fprintf(stderr, "Host sent a %zu-byte session key (max %zu), refusing\n",
+                keyLen, sizeof(s->info.sessionKey));
+        s->done = true;
+        s->result = IHS_StreamingFailed;
+        IHS_ClientStop(c);
+        return;
+    }
     s->info.address = *addr;
     s->info.sessionKeyLen = keyLen;
     memcpy(s->info.sessionKey, key, keyLen);

@@ -4,6 +4,7 @@
 
 #include <string.h>
 #include "ihslib/client.h"
+#include "ihs.h"
 
 #define MAX_HOSTS 16
 
@@ -23,18 +24,11 @@ static void OnDiscovered(IHS_Client *client, const IHS_HostInfo *info, void *ctx
     SDL_UnlockMutex(hostLock);
 }
 
-/* These are a bounding box, not an aspect request: the host scales its own desktop
- * to fit inside, keeping ITS aspect ratio. Asking for 640x480 on a 16:9 host gets
- * you 640x360, not a 4:3 picture. Use the Scaling setting to fill a 4:3 display.
- * Bitrate is per-resolution: a game scene at 1080p60 saturates a wifi link long
- * before the Pi 5's decoder breaks a sweat, so the cap must scale with pixels. */
-static const struct { const char *label; int w, h, fps, kbps; } RES[] = {
-        {"240p",  426,  240,  60,  3000},
-        {"480p",  854,  480,  60,  6000},
-        {"720p",  1280, 720,  60, 10000},
-        {"1080p", 1920, 1080, 60, 15000},
-};
-#define RES_N ((int) SDL_arraysize(RES))
+/* Shared with the libretro core; see PlumeResList in ihs.h. Asking for 640x480 on
+ * a 16:9 host gets you 640x360, not a 4:3 picture — use the Scaling setting to
+ * fill a 4:3 display. */
+#define RES   PlumeResList
+#define RES_N PlumeResCount
 
 static const char *SCALE_NAMES[] = {"Fit", "Stretch", "Crop"};
 #define SCALE_N ((int) SDL_arraysize(SCALE_NAMES))
@@ -460,11 +454,12 @@ static void POnProgress(IHS_Client *c, const IHS_HostInfo *h, void *ctx) { (void
 
 bool PairScreen(SDL_Renderer *renderer, const IHS_ClientConfig *config,
                 const IHS_HostInfo *host) {
-    uint32_t rnd = 0;
-    SDL_IOStream *io = SDL_IOFromFile("/dev/urandom", "rb");
-    if (io) { SDL_ReadIO(io, &rnd, sizeof(rnd)); SDL_CloseIO(io); }
+    /* Not SDL_IOFromFile: it rejects character devices ("/dev/urandom is not a
+     * regular file or pipe"), so the read never happened and every PIN came out
+     * 0000. PlumeMakePin uses plain fopen, which is why the libretro core was
+     * never affected. */
     char pin[5];
-    SDL_snprintf(pin, sizeof(pin), "%04u", rnd % 10000);
+    PlumeMakePin(pin);
 
     IHS_Client *client = IHS_ClientCreate(config);
     PairState st = {0};
@@ -540,11 +535,7 @@ UIAction RunMenu(SDL_Window *window, SDL_Renderer *renderer,
         SDL_free(ids);
     }
 
-    int resIdx = RES_N - 1;
-    for (int i = 0; i < RES_N; i++) {
-        /* Width too: 240p and 240p 4:3 share a height. */
-        if (RES[i].w == out->width && RES[i].h == out->height) { resIdx = i; break; }
-    }
+    int resIdx = PlumeResIndex(out->width, out->height);
     const int resIdx0 = resIdx;
     bool hevc = out->hevc, audio = out->audio, desktop = out->desktop;
     int scale = out->scale;

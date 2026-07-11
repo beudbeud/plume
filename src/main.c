@@ -54,6 +54,18 @@ static volatile bool g_running = true;
 
 static void OnDisconnected(IHS_Session *s, void *ctx) { (void)s;(void)ctx; g_running = false; }
 
+/* IHS_SessionHIDAddProvider only registers the provider — nothing enumerates it.
+ * The device list goes out on IHS_SessionHIDNotifyDeviceChange, which the SDL
+ * backend otherwise only reaches from GAMEPAD_ADDED events (sdl_hid_event.c). By
+ * the time we stream, those fired at SDL_Init and the launcher menu ate them, so
+ * a pad plugged in before launch is never announced and the host sees no
+ * controller. Ask for the enumeration once the control channel is up, the way the
+ * libretro core does. */
+static void OnConnected(IHS_Session *s, void *ctx) {
+    (void) ctx;
+    IHS_SessionHIDNotifyDeviceChange(s);
+}
+
 /* settings.conf: plain "key value" lines, so it can be inspected and hand-edited.
  * Unknown keys are ignored, so a newer file stays readable by an older build. */
 static void LoadSettings(void) {
@@ -186,7 +198,8 @@ static int DoStream(const IHS_HostInfo *host, bool audio) {
     MediaAttach(g_window, g_renderer, audio, (MediaScale) g_scale);
 
     g_running = true; /* reset: OnDisconnected clears it */
-    IHS_StreamSessionCallbacks scb = {.configuring = OnConfiguring, .disconnected = OnDisconnected};
+    IHS_StreamSessionCallbacks scb = {.configuring = OnConfiguring, .connected = OnConnected,
+                                      .disconnected = OnDisconnected};
     IHS_Session *session = IHS_SessionCreate(&PlumeClientConfig, &sinfo);
     IHS_SessionSetLogFunction(session, PlumeLog);
     IHS_SessionSetSessionCallbacks(session, &scb, NULL);

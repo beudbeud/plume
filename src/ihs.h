@@ -23,6 +23,21 @@ void PlumeInstallCrashHandler(void);
 /* How many SDL gamepads are open right now — for the request's slot reservation. */
 int PlumeCountGamepads(void);
 
+/* ---------------------------- offered resolutions -------------------------- */
+/* One table, because the launcher menu and the core's options drifted apart once
+ * already: the CRT modes landed in the core and never reached the menu.
+ *
+ * These are a bounding box, not an aspect request: the host scales its own
+ * desktop to fit inside, keeping ITS aspect ratio. Bitrate follows the
+ * resolution — a 240p stream on a narrow wifi link is pointless if the host still
+ * spends 15 Mbps on it. */
+typedef struct { const char *label; int w, h, fps, kbps; } PlumeRes;
+extern const PlumeRes PlumeResList[];
+extern const int PlumeResCount;
+
+/* Index into PlumeResList, falling back to 1080p for a size that isn't offered. */
+int PlumeResIndex(int w, int h);
+
 /* IHS_LogFunction for IHS_{Client,Session}SetLogFunction. */
 void PlumeLog(IHS_LogLevel level, const char *tag, const char *message);
 

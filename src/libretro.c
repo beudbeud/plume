@@ -54,20 +54,8 @@ static IHS_HostInfo g_host;
 static int g_pairTicks;
 #define PAIR_TIMEOUT_TICKS (90 * 60) /* 90 s at 60 Hz: time to walk to the host */
 
-/* Negotiated caps, from the core options. Bitrate follows the resolution, same
- * table as the launcher's menu (ui.c): a 240p stream on a narrow wifi link is
- * pointless if we still let the host spend 15 Mbps on it. */
-static const struct { const char *label; int w, h, fps, kbps; } RES[] = {
-        {"240p",    426,  240,  60, 3000},
-        {"480p",    854,  480,  60, 6000},
-        {"720p",    1280, 720,  60, 10000},
-        {"1080p",   1920, 1080, 60, 15000},
-        /* CRT modes. 15 kHz cannot scan 480 progressive lines at 60 Hz, so RetroArch
-         * asks switchres for the interlaced mode — but only if we hold a standard
-         * geometry still. 576 lines is PAL, hence 50 Hz. */
-        {"720x480", 720,  480,  60, 6000},
-        {"768x576", 768,  576,  50, 6000},
-};
+/* Negotiated caps, from the core options — PlumeResList (ihs.h) is the same table
+ * the launcher's menu offers. */
 static int g_width = 1280, g_height = 720, g_fps = 60, g_kbps = 10000;
 static bool g_audio = true, g_desktop = true, g_hevc = false;
 /* Off by default: forwarding mouse movement drifts the host cursor, and a host
@@ -103,12 +91,12 @@ static bool OptionIs(const char *key, const char *value) {
 
 /* Read once, at load: all of these are negotiated with the host up front. */
 static void LoadOptions(void) {
-    for (size_t i = 0; i < sizeof(RES) / sizeof(RES[0]); i++) {
-        if (!OptionIs("plume_resolution", RES[i].label)) continue;
-        g_width = RES[i].w;
-        g_height = RES[i].h;
-        g_fps = RES[i].fps;
-        g_kbps = RES[i].kbps;
+    for (int i = 0; i < PlumeResCount; i++) {
+        if (!OptionIs("plume_resolution", PlumeResList[i].label)) continue;
+        g_width = PlumeResList[i].w;
+        g_height = PlumeResList[i].h;
+        g_fps = PlumeResList[i].fps;
+        g_kbps = PlumeResList[i].kbps;
         break;
     }
     g_audio = !OptionIs("plume_audio", "disabled");
