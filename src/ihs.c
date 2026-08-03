@@ -185,13 +185,19 @@ static void OnDiscovered(IHS_Client *client, const IHS_HostInfo *info, void *ctx
     IHS_ClientStop(client);
 }
 
+/* IHSlib stores the callbacks POINTER, not a copy (client.c SetXxxCallbacks),
+ * and calls through it from its worker thread long after the setter returned.
+ * Every callbacks struct handed to it must therefore have static storage — a
+ * local was a dead stack frame by the time the host answered, and the call
+ * through it jumped to whatever had overwritten it (a garbage-pc SIGSEGV). */
+static const IHS_ClientDiscoveryCallbacks DISCOVERY_CALLBACKS = {.discovered = OnDiscovered};
+
 bool PlumeDiscoverHost(const char *wantIp, int timeoutSec, IHS_HostInfo *out) {
     IHS_Client *client = IHS_ClientCreate(&PlumeClientConfig);
     if (!client) return false;
     IHS_ClientSetLogFunction(client, PlumeLog);
     HostPick pick = {.wantIp = wantIp};
-    IHS_ClientDiscoveryCallbacks cb = {.discovered = OnDiscovered};
-    IHS_ClientSetDiscoveryCallbacks(client, &cb, &pick);
+    IHS_ClientSetDiscoveryCallbacks(client, &DISCOVERY_CALLBACKS, &pick);
     IHS_ClientStartDiscovery(client, 1000);
     for (int i = 0; i < timeoutSec * 10 && !SDL_GetAtomicInt(&pick.found); i++) SDL_Delay(100);
     IHS_ClientStopDiscovery(client);
@@ -231,14 +237,19 @@ void PlumeMakePin(char pin[5]) {
     snprintf(pin, 5, "%04u", r % 10000);
 }
 
+/* Static, not a local: IHSlib keeps the pointer (see DISCOVERY_CALLBACKS), and
+ * this function returns while the host is still thinking. The caller's render
+ * loop then trashes the dead frame, and the success callback jumped to garbage
+ * the moment the PIN was accepted. */
+static const IHS_ClientAuthorizationCallbacks AUTH_CALLBACKS = {
+        .progress = OnAuthProgress, .success = OnAuthSuccess, .failed = OnAuthFailed};
+
 bool PlumePairStart(PlumePairing *p, const IHS_HostInfo *host, const char *pin) {
     *p = (PlumePairing) {0};
     p->client = IHS_ClientCreate(&PlumeClientConfig);
     if (!p->client) return false;
     IHS_ClientSetLogFunction(p->client, PlumeLog);
-    IHS_ClientAuthorizationCallbacks cb = {
-            .progress = OnAuthProgress, .success = OnAuthSuccess, .failed = OnAuthFailed};
-    IHS_ClientSetAuthorizationCallbacks(p->client, &cb, p);
+    IHS_ClientSetAuthorizationCallbacks(p->client, &AUTH_CALLBACKS, p);
     /* Discovery keeps the worker thread alive and the socket serviced; without
      * it the request is never delivered. */
     IHS_ClientStartDiscovery(p->client, 0);
@@ -298,9 +309,11 @@ bool PlumeRequestStream(const IHS_HostInfo *host, int maxWidth, int maxHeight, b
     }
     IHS_ClientSetLogFunction(client, PlumeLog);
     StreamReq req = {0};
-    IHS_ClientStreamingCallbacks cb = {
+    /* Static like the others (IHSlib keeps the pointer). This frame does
+     * outlive the client today, but that is one refactor away from a crash. */
+    static const IHS_ClientStreamingCallbacks STREAMING_CALLBACKS = {
             .progress = OnStreamProgress, .success = OnStreamSuccess, .failed = OnStreamFailed};
-    IHS_ClientSetStreamingCallbacks(client, &cb, &req);
+    IHS_ClientSetStreamingCallbacks(client, &STREAMING_CALLBACKS, &req);
     IHS_StreamingRequest r = {
             .streamingEnable = {true, true, true},
             .maxResolution = {maxWidth, maxHeight},

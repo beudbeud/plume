@@ -197,11 +197,13 @@ static SessionEnd RunSession(const IHS_SessionInfo *sinfo, bool audio) {
     MediaAttach(g_window, g_renderer, audio, (MediaScale) g_scale);
 
     g_running = true; /* reset: OnDisconnected clears it */
-    IHS_StreamSessionCallbacks scb = {.configuring = OnConfiguring, .connected = OnConnected,
-                                      .disconnected = OnDisconnected};
+    /* Static: IHSlib keeps the callbacks pointer and calls configuring() from
+     * its worker thread (session_pri.h) — same trap as the client callbacks. */
+    static const IHS_StreamSessionCallbacks SESSION_CALLBACKS = {
+            .configuring = OnConfiguring, .connected = OnConnected, .disconnected = OnDisconnected};
     IHS_Session *session = IHS_SessionCreate(&PlumeClientConfig, sinfo);
     IHS_SessionSetLogFunction(session, PlumeLog);
-    IHS_SessionSetSessionCallbacks(session, &scb, NULL);
+    IHS_SessionSetSessionCallbacks(session, &SESSION_CALLBACKS, NULL);
     IHS_SessionSetVideoCallbacks(session, &VideoCallbacks, NULL);
     IHS_SessionSetAudioCallbacks(session, &AudioCallbacks, NULL);
 

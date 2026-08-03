@@ -52,8 +52,10 @@ self-checks; IHSlib's own tests need a standalone IHSlib build.
 The launcher is an IHSplay-style screen: hosts on the LAN appear in the list.
 Navigate with the D-pad / left stick / arrow keys, **A / Enter** starts streaming
 the selected host, **B / Esc** goes back. Three icons sit in the top-right
-corner: **≡** opens the settings screen, **?** is decorative, **X** quits. It
-loops back to the launcher when a stream ends. Uses DejaVu Sans by default; set
+corner: **≡** opens the settings screen, **?** is decorative, **X** quits. Any
+quit from the launcher (X, B or Esc) asks for confirmation first — B on a pad
+is one press away from killing the app. It loops back to the launcher when a
+stream ends. Uses DejaVu Sans by default; set
 `PLUME_FONT=/path/to.ttf` to override.
 
 First time on a host, Start shows a **pairing screen** with a PIN — type it into

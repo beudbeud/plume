@@ -496,6 +496,62 @@ static void SettingsScreen(SDL_Renderer *renderer, SDL_Gamepad *pad, int *resIdx
     #undef APPLY
 }
 
+/* Modal "really quit?" over the launcher — B on a pad is one press away from
+ * killing the app. Returns true to quit; defaults to No. */
+static bool ConfirmQuit(SDL_Renderer *renderer, SDL_Gamepad *pad) {
+    const SDL_Color white = {255, 255, 255, 255}, dim = {180, 195, 215, 255};
+    bool yes = false; /* an accidental Accept must do nothing */
+    int decided = -1; /* -1 open, 0 stay, 1 quit */
+    NavState nav = {0};
+    SDL_PumpEvents();
+    SDL_FlushEvents(SDL_EVENT_FIRST, SDL_EVENT_LAST);
+    while (decided < 0) {
+        int ndx, ndy;
+        if (NavPoll(&nav, pad, &ndx, &ndy) && ndx) yes = !yes;
+        SDL_Event e;
+        while (SDL_PollEvent(&e) && decided < 0) {
+            switch (e.type) {
+                case SDL_EVENT_QUIT: decided = 1; break; /* window close: don't argue */
+                case SDL_EVENT_KEY_DOWN:
+                    switch (e.key.key) {
+                        case SDLK_LEFT: case SDLK_RIGHT: yes = !yes; break;
+                        case SDLK_RETURN: case SDLK_SPACE: decided = yes; break;
+                        case SDLK_ESCAPE: decided = 0; break;
+                        default: break;
+                    }
+                    break;
+                case SDL_EVENT_GAMEPAD_BUTTON_DOWN:
+                    if (BtnIsAccept(e.gbutton.which, e.gbutton.button)) decided = yes;
+                    else if (BtnIsBack(e.gbutton.which, e.gbutton.button)) decided = 0;
+                    break;
+                default: break;
+            }
+        }
+        UIEnsureFonts(renderer);
+        int W, H;
+        SDL_GetRenderOutputSize(renderer, &W, &H);
+        float bt = H * 0.006f; if (bt < 2) bt = 2;
+        Gradient(renderer, W, H);
+        Text(renderer, uiTitleFont, "Quit Plume?", 0, H * 0.3f, white, W);
+        float bw = W * 0.18f, bh = H * 0.1f, by = H * 0.52f;
+        struct { const char *label; float x; bool sel; } btn[2] = {
+                {"Yes", W / 2.0f - bw - W * 0.02f, yes},
+                {"No",  W / 2.0f + W * 0.02f, !yes},
+        };
+        for (int i = 0; i < 2; i++) {
+            FillRect(renderer, btn[i].x, by, bw, bh, btn[i].sel ? 90 : 60, btn[i].sel ? 115 : 80,
+                     btn[i].sel ? 155 : 110, 235);
+            if (btn[i].sel) Border(renderer, btn[i].x, by, bw, bh, bt, 60, 170, 245);
+            Text(renderer, uiFont, btn[i].label, btn[i].x, by + bh * 0.28f, btn[i].sel ? white : dim, bw);
+        }
+        Text(renderer, uiFont, "(A) Select   (B) Cancel", 0, H * 0.78f, dim, W);
+        SDL_RenderPresent(renderer);
+    }
+    SDL_PumpEvents();
+    SDL_FlushEvents(SDL_EVENT_FIRST, SDL_EVENT_LAST); /* don't leak the closing press */
+    return decided == 1;
+}
+
 /* Launcher focus graph. Indices: 0 = Start tile (left column), 1..n = host rows
  * (right column). The two top-right icons use negative indices so they stay put
  * when a host appears or disappears mid-navigation.
@@ -572,8 +628,9 @@ UIAction RunMenu(SDL_Window *window, SDL_Renderer *renderer,
     hostCount = 0;
 
     IHS_Client *client = IHS_ClientCreate(config);
-    IHS_ClientDiscoveryCallbacks cb = {.discovered = OnDiscovered};
-    IHS_ClientSetDiscoveryCallbacks(client, &cb, NULL);
+    /* Static: IHSlib keeps the callbacks pointer (see ihs.c). */
+    static const IHS_ClientDiscoveryCallbacks DISCOVERY_CALLBACKS = {.discovered = OnDiscovered};
+    IHS_ClientSetDiscoveryCallbacks(client, &DISCOVERY_CALLBACKS, NULL);
     IHS_ClientStartDiscovery(client, 2000); /* re-broadcast every 2s */
 
     /* Drop input left over from however we were launched (e.g. the button ES
@@ -655,19 +712,29 @@ UIAction RunMenu(SDL_Window *window, SDL_Renderer *renderer,
                         case SDLK_LEFT: focus = MenuMove(focus, -1, 0, n); break;
                         case SDLK_RIGHT: focus = MenuMove(focus, 1, 0, n); break;
                         case SDLK_RETURN: case SDLK_SPACE: goto activate;
-                        case SDLK_ESCAPE: if (!grace) running = false; break;
+                        case SDLK_ESCAPE:
+                            if (!grace && ConfirmQuit(renderer, pad)) running = false;
+                            nav = (NavState) {0};
+                            break;
                         default: break;
                     }
                     break;
                 case SDL_EVENT_GAMEPAD_BUTTON_DOWN: /* directions come from NavPoll */
                     if (BtnIsAccept(e.gbutton.which, e.gbutton.button)) goto activate;
-                    else if (!grace && BtnIsBack(e.gbutton.which, e.gbutton.button)) running = false;
+                    else if (!grace && BtnIsBack(e.gbutton.which, e.gbutton.button)) {
+                        if (ConfirmQuit(renderer, pad)) running = false;
+                        nav = (NavState) {0};
+                    }
                     break;
                 default: break;
             }
             continue;
             activate:
-            if (focus == FOCUS_QUIT) { action = UI_QUIT; running = false; break; }
+            if (focus == FOCUS_QUIT) {
+                if (ConfirmQuit(renderer, pad)) { action = UI_QUIT; running = false; }
+                nav = (NavState) {0};
+                break;
+            }
             if (focus == FOCUS_SETTINGS) {
                 SettingsScreen(renderer, pad, &resIdx, &kbps, &hevc, &audio, &desktop, &scale);
                 nav = (NavState) {0}; /* the stick may still be held; don't carry it back */
