@@ -19,7 +19,7 @@ jobs:
             libsdl3-dev libsdl3-ttf-dev \
             libavcodec-dev libavutil-dev libswscale-dev libswresample-dev \
             libprotobuf-c-dev libmbedtls-dev
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
         with:
           submodules: recursive
       - name: Configure
