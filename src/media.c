@@ -69,8 +69,6 @@ static SDL_AtomicInt statsDropped;    /* cumulative latch overwrites */
 
 void MediaToggleStats(void) {
     statsOn = !statsOn;
-    statsLine[0] = '\0';
-    statsT0 = 0; /* restart the 1 s window on the next present */
     if (statsOn && planeActive) {
         /* The DRM plane sits above SDL's output: the overlay would be
          * invisible behind the video. Drop to the GPU path while it's shown. */
@@ -376,14 +374,9 @@ static IHS_StreamVideoSubmitResult VideoSubmit(IHS_Session *session, uint16_t fr
     av_packet_unref(vpkt);
 
     /* Decode runs inline on the session worker thread, so >16ms here starves
-     * audio too and overflows the video ring. Report the average periodically. */
-    static Uint64 accNs; static int accN;
+     * audio too and overflows the video ring; the per-second stats line
+     * reports it as its `dec` figure. */
     SDL_AddAtomicInt(&statsDecodeUs, (int) ((SDL_GetTicksNS() - t0) / 1000));
-    accNs += SDL_GetTicksNS() - t0;
-    if (++accN == 120) {
-        SDL_Log("decode: %.1f ms/frame avg", (double) accNs / accN / 1e6);
-        accNs = 0; accN = 0;
-    }
     return ret;
 }
 
@@ -494,23 +487,26 @@ void MediaPresent(void) {
             SDL_RenderTexture(renderer, shownTex, NULL, &dst);
         }
     }
-    if (statsOn) {
-        Uint64 now = SDL_GetTicksNS();
-        if (statsT0 == 0) { statsT0 = now; statsShown = 0; }
-        if (now - statsT0 >= 1000000000ull) {
-            float dt = (float) (now - statsT0) / 1e9f;
-            int bytes = SDL_SetAtomicInt(&statsBytes, 0); /* returns the old value */
-            int dec = SDL_SetAtomicInt(&statsDecoded, 0);
-            int us = SDL_SetAtomicInt(&statsDecodeUs, 0);
-            SDL_snprintf(statsLine, sizeof(statsLine),
-                         "%dx%d %s | %.0f fps | %.1f Mbps | dec %.1f ms | drop %d",
-                         shownW, shownH, statsCodec, statsShown / dt, bytes * 8.0f / dt / 1e6f,
-                         dec > 0 ? us / 1000.0f / dec : 0.0f, SDL_GetAtomicInt(&statsDropped));
-            statsShown = 0;
-            statsT0 = now;
-        }
-        if (statsLine[0]) UIDrawOverlay(renderer, statsLine);
+    /* The stats window runs whether or not the overlay is shown: the same
+     * line goes to the log once per second (Info, so --verbose), which is how
+     * you watch a session over ssh without touching the pad. */
+    Uint64 now = SDL_GetTicksNS();
+    if (statsT0 == 0) { statsT0 = now; statsShown = 0; }
+    if (now - statsT0 >= 1000000000ull) {
+        float dt = (float) (now - statsT0) / 1e9f;
+        int bytes = SDL_SetAtomicInt(&statsBytes, 0); /* returns the old value */
+        int dec = SDL_SetAtomicInt(&statsDecoded, 0);
+        int us = SDL_SetAtomicInt(&statsDecodeUs, 0);
+        SDL_snprintf(statsLine, sizeof(statsLine),
+                     "%dx%d %s%s | %.0f fps | %.1f Mbps | dec %.1f ms | drop %d",
+                     shownW, shownH, statsCodec, planeActive ? " plane" : "",
+                     statsShown / dt, bytes * 8.0f / dt / 1e6f,
+                     dec > 0 ? us / 1000.0f / dec : 0.0f, SDL_GetAtomicInt(&statsDropped));
+        SDL_Log("stats: %s", statsLine);
+        statsShown = 0;
+        statsT0 = now;
     }
+    if (statsOn && statsLine[0]) UIDrawOverlay(renderer, statsLine);
     SDL_RenderPresent(renderer);
 
     /* Reported after present: this is the cursor the 1 Hz stats flush walks, and

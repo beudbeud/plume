@@ -65,7 +65,7 @@ resumes automatically once approved. (`--pair` does the same headlessly.)
 Leave a running stream with **Hotkey + Start** on the gamepad (Hotkey = Guide/Home,
 or Select if the pad has no Guide), or Esc on the keyboard. **Hotkey + Y** (or F3)
 toggles a stats overlay: resolution, codec, fps, bitrate, decode time, dropped
-frames.
+frames. The same line lands in the log once per second under `--verbose`.
 
 If the stream drops without you asking — a Wi-Fi blip, a host hiccup — plume
 requests a fresh session from the host and resumes on its own, up to five tries.
@@ -152,8 +152,10 @@ Run with `--verbose` and look for the `drm-plane:` and `zero-copy:` log lines
 to see which path you got. `PLUME_NO_ZEROCOPY=1` restores the old
 decode-thread readback entirely.
 
-The `decode: N ms/frame` log line is *not* the cost of decoding a frame. With
-frame threading, `avcodec_send_packet` returns before the work is done, so it
+With `--verbose`, the overlay's line is also logged once per second as
+`stats: ...` (with a `plane` tag when the DRM plane is scanning) — handy over
+ssh. Its `dec` figure is *not* the cost of decoding a frame: with frame
+threading, `avcodec_send_packet` returns before the work is done, so it
 measures the serialized part only; the real work is spread across cores.
 
 ## Patches to IHSlib
