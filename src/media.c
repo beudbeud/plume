@@ -14,6 +14,7 @@
 #include <libswresample/swresample.h>
 #include <libavutil/opt.h>
 #include <libavutil/hwcontext.h>
+#include <libavutil/pixdesc.h>
 
 /* ---- SDL window / renderer (borrowed from main.c) ---- */
 static SDL_Window *window;
@@ -27,7 +28,13 @@ static AVCodecContext *vctx;
 static AVBufferRef *hwDeviceCtx;              /* HW decode device (Pi5 HEVC via V4L2-request/DRM) */
 static enum AVPixelFormat hwPixFmt = AV_PIX_FMT_NONE;
 static struct SwsContext *sws;
-static struct SwsContext *swsOut;             /* headless: YUV -> XRGB8888 for the caller */
+static AVPacket *vpkt;   /* reused per submit: the network thread is the hot path */
+static AVFrame *vframe;
+/* Flush the decoder only at the keyframe that follows an actual loss. Flushing
+ * every keyframe drains the frame-threading pipeline — a visible hitch per IDR. */
+static bool vNeedFlush;
+static bool vHaveLast;
+static uint16_t vLastFrameId;
 static SDL_Mutex *frameLock;
 static AVFrame *latched; /* newest decoded frame; a ref into the decoder's pool, no copy */
 static AVFrame *consumed; /* the frame being shown; consumer thread only, never locked */
@@ -44,6 +51,8 @@ static bool audioEnabled;
 static SDL_AudioStream *audioStream;
 static AVCodecContext *actx;
 static SwrContext *swr;
+static AVPacket *apkt;   /* reused per submit, like the video pair */
+static AVFrame *aframe;
 static int audioChannels;
 
 void MediaAttach(SDL_Window *w, SDL_Renderer *r, bool enableAudio, MediaScale scale) {
@@ -62,7 +71,6 @@ void MediaDetach(void) {
     statsSession = NULL; /* the session is being torn down; never report into it */
     frameDirty = false;
     if (texture) { SDL_DestroyTexture(texture); texture = NULL; texW = texH = 0; }
-    if (swsOut) { sws_freeContext(swsOut); swsOut = NULL; }
     if (frameLock) { SDL_DestroyMutex(frameLock); frameLock = NULL; }
     av_frame_free(&latched);
     av_frame_free(&consumed);
@@ -80,6 +88,12 @@ static enum AVPixelFormat GetHwFormat(AVCodecContext *ctx, const enum AVPixelFor
         if (*p == hwPixFmt) return *p;
     }
     SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION, "hw pixel format unavailable, falling back to software output");
+    /* fmts[0] can be another hardware format we have no frames context for; the
+     * first *software* entry is the one the decoder can actually hand us. */
+    for (const enum AVPixelFormat *p = fmts; *p != AV_PIX_FMT_NONE; p++) {
+        const AVPixFmtDescriptor *d = av_pix_fmt_desc_get(*p);
+        if (d && !(d->flags & AV_PIX_FMT_FLAG_HWACCEL)) return *p;
+    }
     return fmts[0];
 }
 
@@ -89,6 +103,16 @@ static int VideoStart(IHS_Session *session, const IHS_StreamVideoConfig *config,
     enum AVCodecID id = hevc ? AV_CODEC_ID_HEVC : AV_CODEC_ID_H264;
     const AVCodec *sw = avcodec_find_decoder(id);
     if (!sw) { SDL_LogError(SDL_LOG_CATEGORY_APPLICATION, "no decoder for codec %d", config->codec); return -1; }
+
+    vpkt = av_packet_alloc();
+    vframe = av_frame_alloc();
+    if (!vpkt || !vframe) {
+        av_packet_free(&vpkt);
+        av_frame_free(&vframe);
+        return -1;
+    }
+    vNeedFlush = false;
+    vHaveLast = false;
 
     /* Two shapes of hardware decode, and the Pi generations disagree on which:
      *
@@ -156,6 +180,8 @@ static int VideoStart(IHS_Session *session, const IHS_StreamVideoConfig *config,
         avcodec_free_context(&vctx);
         if (hwDeviceCtx) av_buffer_unref(&hwDeviceCtx);
     }
+    av_packet_free(&vpkt);
+    av_frame_free(&vframe);
     SDL_LogError(SDL_LOG_CATEGORY_APPLICATION, "no usable decoder for codec %d", config->codec);
     return -1;
 }
@@ -199,64 +225,83 @@ static AVFrame *TakeFrame(uint16_t *frameId) {
     return consumed;
 }
 
+/* Drain every frame the decoder has ready into the latch. */
+static void ReceiveFrames(uint16_t frameId) {
+    while (avcodec_receive_frame(vctx, vframe) == 0) {
+        /* If a HW decoder handed back GPU frames, pull them into system
+         * memory (offloads decode; pays one readback — still far cheaper
+         * than software HEVC). Most Pi v4l2m2m builds return NV12 directly,
+         * so this branch is usually skipped. */
+        AVFrame *sw = vframe, *dl = NULL;
+        if (vframe->hw_frames_ctx) {
+            dl = av_frame_alloc();
+            if (dl && av_hwframe_transfer_data(dl, vframe, 0) == 0) sw = dl;
+        }
+        /* YUV420P and NV12 upload as-is (IYUV/NV12 textures); anything else
+         * goes via swscale. */
+        if (sw->format == AV_PIX_FMT_YUV420P || sw->format == AV_PIX_FMT_NV12) {
+            StashFrame(sw, frameId);
+        } else {
+            sws = sws_getCachedContext(sws, sw->width, sw->height, sw->format,
+                                       sw->width, sw->height, AV_PIX_FMT_YUV420P,
+                                       SWS_BILINEAR, NULL, NULL, NULL);
+            AVFrame *o = av_frame_alloc();
+            if (sws && o) {
+                o->format = AV_PIX_FMT_YUV420P; o->width = sw->width; o->height = sw->height;
+                if (av_frame_get_buffer(o, 32) == 0) {
+                    sws_scale(sws, (const uint8_t *const *) sw->data, sw->linesize, 0, sw->height,
+                              o->data, o->linesize);
+                    StashFrame(o, frameId);
+                }
+            }
+            av_frame_free(&o);
+        }
+        av_frame_free(&dl);
+    }
+}
+
 static IHS_StreamVideoSubmitResult VideoSubmit(IHS_Session *session, uint16_t frameId, IHS_Buffer *data,
                                                IHS_StreamVideoFrameFlag flags, void *context) {
     (void) context;
     statsSession = session;
-    /* After dropped frames the decoder holds stale references and rejects every
-     * later slice ("Frame num change"). A keyframe is a clean restart point. */
-    if (flags & IHS_StreamVideoFrameKeyFrame) {
+    /* A gap in frame ids means frames never reached us: the decoder holds stale
+     * references and rejects every later slice ("Frame num change"). Note it and
+     * restart clean at the next keyframe — flushing every keyframe would drain
+     * the frame-threading pipeline for nothing. */
+    if (vHaveLast && frameId != (uint16_t) (vLastFrameId + 1)) vNeedFlush = true;
+    vLastFrameId = frameId;
+    vHaveLast = true;
+    if ((flags & IHS_StreamVideoFrameKeyFrame) && vNeedFlush) {
         avcodec_flush_buffers(vctx);
+        vNeedFlush = false;
     }
     /* av_new_packet allocates AV_INPUT_BUFFER_PADDING_SIZE zeroed bytes past the
      * end — the bitstream reader over-reads, and IHS_Buffer has no such padding. */
-    AVPacket *pkt = av_packet_alloc();
-    if (av_new_packet(pkt, (int) data->size) < 0) {
-        av_packet_free(&pkt);
+    if (av_new_packet(vpkt, (int) data->size) < 0) {
+        vNeedFlush = true;
         IHS_SessionReportVideoFrameComplete(session, frameId, IHS_VideoFrameResultDroppedNetworkLost);
         return IHS_StreamVideoSubmitReportLost;
     }
-    memcpy(pkt->data, IHS_BufferPointer(data), data->size);
+    memcpy(vpkt->data, IHS_BufferPointer(data), data->size);
     IHS_StreamVideoSubmitResult ret = IHS_StreamVideoSubmitOK;
     Uint64 t0 = SDL_GetTicksNS();
     IHS_SessionReportVideoFrameStage(session, frameId, IHS_VideoFrameStageDecodeBegin, 0);
-    if (avcodec_send_packet(vctx, pkt) == 0) {
-        AVFrame *f = av_frame_alloc();
-        while (avcodec_receive_frame(vctx, f) == 0) {
-            /* If a HW decoder handed back GPU frames, pull them into system
-             * memory (offloads decode; pays one readback — still far cheaper
-             * than software HEVC). Most Pi v4l2m2m builds return NV12 directly,
-             * so this branch is usually skipped. */
-            AVFrame *sw = f, *dl = NULL;
-            if (f->hw_frames_ctx) {
-                dl = av_frame_alloc();
-                if (av_hwframe_transfer_data(dl, f, 0) == 0) sw = dl;
-            }
-            /* YUV420P and NV12 upload as-is (IYUV/NV12 textures); anything else
-             * goes via swscale. */
-            if (sw->format == AV_PIX_FMT_YUV420P || sw->format == AV_PIX_FMT_NV12) {
-                StashFrame(sw, frameId);
-            } else {
-                sws = sws_getCachedContext(sws, sw->width, sw->height, sw->format,
-                                           sw->width, sw->height, AV_PIX_FMT_YUV420P,
-                                           SWS_BILINEAR, NULL, NULL, NULL);
-                AVFrame *o = av_frame_alloc();
-                o->format = AV_PIX_FMT_YUV420P; o->width = sw->width; o->height = sw->height;
-                av_frame_get_buffer(o, 32);
-                sws_scale(sws, (const uint8_t *const *) sw->data, sw->linesize, 0, sw->height,
-                          o->data, o->linesize);
-                StashFrame(o, frameId);
-                av_frame_free(&o);
-            }
-            av_frame_free(&dl);
-        }
-        av_frame_free(&f);
+    int err = avcodec_send_packet(vctx, vpkt);
+    if (err == AVERROR(EAGAIN)) {
+        /* Not a bad packet — the decoder wants draining first. Reporting it lost
+         * would make the host burn a keyframe for nothing. */
+        ReceiveFrames(frameId);
+        err = avcodec_send_packet(vctx, vpkt);
+    }
+    if (err == 0) {
+        ReceiveFrames(frameId);
     } else {
         ret = IHS_StreamVideoSubmitReportLost;
+        vNeedFlush = true;
         IHS_SessionReportVideoFrameComplete(session, frameId, IHS_VideoFrameResultDroppedDecodeCorrupt);
     }
     IHS_SessionReportVideoFrameStage(session, frameId, IHS_VideoFrameStageDecodeEnd, 0);
-    av_packet_free(&pkt);
+    av_packet_unref(vpkt);
 
     /* Decode runs inline on the session worker thread, so >16ms here starves
      * audio too and overflows the video ring. Report the average periodically. */
@@ -274,6 +319,8 @@ static void VideoStop(IHS_Session *session, void *context) {
     if (sws) { sws_freeContext(sws); sws = NULL; }
     if (vctx) { avcodec_free_context(&vctx); }
     if (hwDeviceCtx) { av_buffer_unref(&hwDeviceCtx); }
+    av_packet_free(&vpkt);
+    av_frame_free(&vframe);
 }
 
 void MediaPresent(void) {
@@ -326,47 +373,6 @@ void MediaPresent(void) {
     if (f) IHS_SessionReportVideoFrameComplete(statsSession, shownId, IHS_VideoFrameResultDisplayed);
 }
 
-/* Headless twin of MediaPresent: same latch, same frame accounting, but the
- * picture lands in the caller's buffer, scaled to a fixed dstW x dstH with black
- * bars.
- * ponytail: MEDIA_SCALE_CROP falls back to fit; it needs source cropping.
- * ponytail: swscale to XRGB8888 costs a full-frame pass per frame (~5 ms for
- * 1080p on a Pi 5). Switch to libretro's GL hw_render with a YUV shader if that
- * ever shows up in the frame budget. */
-bool MediaPullVideo(void *pixels, int pitch, int dstW, int dstH) {
-    /* Last letterbox rect, so the bars are cleared once instead of every frame. */
-    static int barW, barH;
-    uint16_t shownId = 0;
-    AVFrame *f = TakeFrame(&shownId);
-    if (!f) return false;
-
-    int w = dstW, h = dstH, x = 0, y = 0;
-    if (scaleMode != MEDIA_SCALE_STRETCH) {
-        /* The host streams its own aspect ratio inside the box we asked for, and
-         * it changes it whenever the captured window does. Scale to fit here so
-         * the frontend always sees one fixed geometry. */
-        float scale = SDL_min((float) dstW / f->width, (float) dstH / f->height);
-        w = (int) (f->width * scale) & ~1; /* even: chroma is subsampled */
-        h = (int) (f->height * scale) & ~1;
-        x = (dstW - w) / 2;
-        y = (dstH - h) / 2;
-    }
-    if (w != barW || h != barH) {
-        memset(pixels, 0, (size_t) dstH * pitch); /* new bars, paint them black once */
-        barW = w;
-        barH = h;
-    }
-    swsOut = sws_getCachedContext(swsOut, f->width, f->height, f->format,
-                                  w, h, AV_PIX_FMT_BGRA, SWS_BILINEAR, NULL, NULL, NULL);
-    uint8_t *dst[4] = {(uint8_t *) pixels + (size_t) y * pitch + (size_t) x * 4};
-    int dstLines[4] = {pitch};
-    sws_scale(swsOut, (const uint8_t *const *) f->data, f->linesize, 0, f->height, dst, dstLines);
-
-    IHS_SessionReportVideoFrameStage(statsSession, shownId, IHS_VideoFrameStageUploadEnd, 0);
-    IHS_SessionReportVideoFrameComplete(statsSession, shownId, IHS_VideoFrameResultDisplayed);
-    return true;
-}
-
 const IHS_StreamVideoCallbacks VideoCallbacks = {
         .start = VideoStart,
         .submit = VideoSubmit,
@@ -378,12 +384,6 @@ const IHS_StreamVideoCallbacks VideoCallbacks = {
 static int AudioStart(IHS_Session *session, const IHS_StreamAudioConfig *config, void *context) {
     (void) session; (void) context;
     if (!audioEnabled) return 0;
-    /* Headless callers hand the samples straight to libretro, which is stereo-only. */
-    if (!renderer && config->channels != 2) {
-        SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION, "%d audio channels, muting", (int) config->channels);
-        audioEnabled = false;
-        return 0;
-    }
     if (config->codec != IHS_StreamAudioCodecOpus) {
         SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION, "unsupported audio codec %d, muting", config->codec);
         audioEnabled = false;
@@ -407,45 +407,45 @@ static int AudioStart(IHS_Session *session, const IHS_StreamAudioConfig *config,
     av_opt_set_sample_fmt(swr, "out_sample_fmt", AV_SAMPLE_FMT_S16, 0);
     swr_init(swr);
 
-    /* Headless: a device-less SDL_AudioStream is just the queue, which is all
-     * MediaPullAudio needs — no second ring buffer to write and get wrong. */
     SDL_AudioSpec want = {SDL_AUDIO_S16, audioChannels, actx->sample_rate};
-    audioStream = renderer ? SDL_OpenAudioDeviceStream(SDL_AUDIO_DEVICE_DEFAULT_PLAYBACK, &want, NULL, NULL)
-                           : SDL_CreateAudioStream(&want, &want);
+    audioStream = SDL_OpenAudioDeviceStream(SDL_AUDIO_DEVICE_DEFAULT_PLAYBACK, &want, NULL, NULL);
     if (!audioStream) { audioEnabled = false; return 0; }
-    if (renderer) SDL_ResumeAudioStreamDevice(audioStream);
-    return 0;
-}
+    SDL_ResumeAudioStreamDevice(audioStream);
 
-int MediaPullAudio(int16_t *out, int maxFrames) {
-    if (!audioEnabled || !audioStream) return 0;
-    int got = SDL_GetAudioStreamData(audioStream, out, maxFrames * audioChannels * (int) sizeof(int16_t));
-    return got > 0 ? got / (audioChannels * (int) sizeof(int16_t)) : 0;
+    apkt = av_packet_alloc();
+    aframe = av_frame_alloc();
+    if (!apkt || !aframe) {
+        av_packet_free(&apkt);
+        av_frame_free(&aframe);
+        audioEnabled = false;
+    }
+    return 0;
 }
 
 static int AudioSubmit(IHS_Session *session, IHS_Buffer *data, void *context) {
     (void) session; (void) context;
     if (!audioEnabled) return 0;
-    AVPacket *pkt = av_packet_alloc();
-    if (av_new_packet(pkt, (int) data->size) < 0) { /* needs FFmpeg's zero padding, see VideoSubmit */
-        av_packet_free(&pkt);
+    if (av_new_packet(apkt, (int) data->size) < 0) /* needs FFmpeg's zero padding, see VideoSubmit */
         return 0;
-    }
-    memcpy(pkt->data, IHS_BufferPointer(data), data->size);
-    if (avcodec_send_packet(actx, pkt) == 0) {
-        AVFrame *f = av_frame_alloc();
-        while (avcodec_receive_frame(actx, f) == 0) {
+    memcpy(apkt->data, IHS_BufferPointer(data), data->size);
+    if (avcodec_send_packet(actx, apkt) == 0) {
+        while (avcodec_receive_frame(actx, aframe) == 0) {
             /* Opus caps at 120 ms per packet: 5760 samples/channel at 48 kHz. */
             static int16_t pcm[5760 * 2];
             uint8_t *out = (uint8_t *) pcm;
             int cap = (int) (sizeof(pcm) / sizeof(pcm[0])) / audioChannels;
-            int n = swr_convert(swr, &out, cap, (const uint8_t **) f->extended_data, f->nb_samples);
-            if (n > 0)
-                SDL_PutAudioStreamData(audioStream, pcm, n * audioChannels * (int) sizeof(int16_t));
+            int n = swr_convert(swr, &out, cap, (const uint8_t **) aframe->extended_data, aframe->nb_samples);
+            if (n <= 0) continue;
+            /* Latency cap: a device clock a hair slower than the host's 48 kHz
+             * otherwise grows this queue — and the audio delay — without bound
+             * over a long session. Dropping the backlog resyncs in one hiccup. */
+            int queuedMax = actx->sample_rate * audioChannels * (int) sizeof(int16_t) / 5; /* 200 ms */
+            if (SDL_GetAudioStreamQueued(audioStream) > queuedMax)
+                SDL_ClearAudioStream(audioStream);
+            SDL_PutAudioStreamData(audioStream, pcm, n * audioChannels * (int) sizeof(int16_t));
         }
-        av_frame_free(&f);
     }
-    av_packet_free(&pkt);
+    av_packet_unref(apkt);
     return 0;
 }
 
@@ -454,6 +454,8 @@ static void AudioStop(IHS_Session *session, void *context) {
     if (audioStream) { SDL_DestroyAudioStream(audioStream); audioStream = NULL; }
     if (swr) { swr_free(&swr); }
     if (actx) { avcodec_free_context(&actx); }
+    av_packet_free(&apkt);
+    av_frame_free(&aframe);
 }
 
 const IHS_StreamAudioCallbacks AudioCallbacks = {

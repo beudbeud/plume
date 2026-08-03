@@ -1,9 +1,9 @@
-/* The IHSlib bits both front-ends need: device identity, logging, discovery and
- * the streaming request. main.c drives them from a window, libretro.c from
- * inside RetroArch; neither should own a second copy of the creds file format. */
+/* The IHSlib plumbing under the client: device identity, logging, discovery and
+ * the streaming request. */
 #pragma once
 
 #include <stdbool.h>
+#include <SDL3/SDL.h>
 #include "ihslib.h"
 #include "ihslib/client.h"
 
@@ -24,10 +24,7 @@ void PlumeInstallCrashHandler(void);
 int PlumeCountGamepads(void);
 
 /* ---------------------------- offered resolutions -------------------------- */
-/* One table, because the launcher menu and the core's options drifted apart once
- * already: the CRT modes landed in the core and never reached the menu.
- *
- * These are a bounding box, not an aspect request: the host scales its own
+/* These are a bounding box, not an aspect request: the host scales its own
  * desktop to fit inside, keeping ITS aspect ratio. Bitrate follows the
  * resolution — a 240p stream on a narrow wifi link is pointless if the host still
  * spends 15 Mbps on it. */
@@ -52,11 +49,12 @@ bool PlumeRequestStream(const IHS_HostInfo *host, int maxWidth, int maxHeight, b
 /* ------------------------------- pairing ---------------------------------- */
 /* Split in two because the caller has to show the PIN while the host waits for
  * it: a blocking pair() would never get a chance to draw it. Start, then poll
- * `done` from your frame loop, then Finish. */
+ * `done` from your frame loop, then Finish. Atomics, not volatile: the callbacks
+ * write from IHSlib's thread, and arm64 reorders plain stores. */
 typedef struct {
     IHS_Client *client;
-    volatile bool done;   /* the host answered, either way */
-    volatile bool ok;
+    SDL_AtomicInt done;   /* the host answered, either way */
+    SDL_AtomicInt ok;
 } PlumePairing;
 
 /* Four digits the user types into Steam on the host. */

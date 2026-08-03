@@ -24,9 +24,8 @@ static void OnDiscovered(IHS_Client *client, const IHS_HostInfo *info, void *ctx
     SDL_UnlockMutex(hostLock);
 }
 
-/* Shared with the libretro core; see PlumeResList in ihs.h. Asking for 640x480 on
- * a 16:9 host gets you 640x360, not a 4:3 picture — use the Scaling setting to
- * fill a 4:3 display. */
+/* See PlumeResList in ihs.h. Asking for 640x480 on a 16:9 host gets you 640x360,
+ * not a 4:3 picture — use the Scaling setting to fill a 4:3 display. */
 #define RES   PlumeResList
 #define RES_N PlumeResCount
 
@@ -73,7 +72,10 @@ bool UIEnsureFonts(SDL_Renderer *renderer) {
     return uiFont && uiTitleFont && uiFontSmall;
 }
 
+static void FlushTextCache(void);
+
 void UICloseFonts(void) {
+    FlushTextCache(); /* entries are keyed by font pointer; a reopened font can reuse the address */
     if (uiFont) TTF_CloseFont(uiFont);
     if (uiTitleFont) TTF_CloseFont(uiTitleFont);
     if (uiFontSmall) TTF_CloseFont(uiFontSmall);
@@ -233,23 +235,57 @@ static void Logo(SDL_Renderer *r, float x, float y, float h) {
     Bar(r, x + 70 * sc, y + 18 * sc, 20 * sc, bh, ice);
 }
 
-/* Render text; returns width. Anchors top-left unless centered in [x,x+boxW]. */
-static float Text(SDL_Renderer *r, TTF_Font *f, const char *s, float x, float y,
-                  SDL_Color col, float boxW) {
-    SDL_Surface *surf = TTF_RenderText_Blended(f, s, strlen(s), col);
-    if (!surf) return 0;
+/* The menu redraws the same ~15 strings at 60 fps; rasterising + uploading a
+ * texture per string per frame was the menu's whole CPU bill on a Pi. Cache
+ * white-rendered textures keyed by font+string (colour applied via mod at draw
+ * time) with round-robin eviction; UICloseFonts flushes it. */
+typedef struct { TTF_Font *font; char *str; SDL_Texture *tex; float w, h; } TextEntry;
+static TextEntry textCache[48]; /* > strings on the busiest screen, so a full frame never evicts itself */
+static int textNext;
+
+static void FlushTextCache(void) {
+    for (size_t i = 0; i < SDL_arraysize(textCache); i++) {
+        if (textCache[i].tex) SDL_DestroyTexture(textCache[i].tex);
+        SDL_free(textCache[i].str);
+        textCache[i] = (TextEntry) {0};
+    }
+    textNext = 0;
+}
+
+static TextEntry *TextTexture(SDL_Renderer *r, TTF_Font *f, const char *s) {
+    for (size_t i = 0; i < SDL_arraysize(textCache); i++) {
+        TextEntry *e = &textCache[i];
+        if (e->tex && e->str && e->font == f && strcmp(e->str, s) == 0) return e;
+    }
+    SDL_Surface *surf = TTF_RenderText_Blended(f, s, strlen(s), (SDL_Color) {255, 255, 255, 255});
+    if (!surf) return NULL;
     SDL_Texture *tex = SDL_CreateTextureFromSurface(r, surf);
     float tw = (float) surf->w, th = (float) surf->h;
-    /* Centering a string wider than its box would start it off screen. */
-    if (boxW > 0 && tw < boxW) x += (boxW - tw) / 2;
+    SDL_DestroySurface(surf);
+    if (!tex) return NULL;
     /* Glyphs are rendered 1:1; a subpixel offset through LINEAR filtering
      * smears them half a pixel. Pin to the pixel grid, copy untouched. */
     SDL_SetTextureScaleMode(tex, SDL_SCALEMODE_NEAREST);
-    SDL_FRect dst = {SDL_floorf(x + 0.5f), SDL_floorf(y + 0.5f), tw, th};
-    SDL_RenderTexture(r, tex, NULL, &dst);
-    SDL_DestroyTexture(tex);
-    SDL_DestroySurface(surf);
-    return tw;
+    TextEntry *e = &textCache[textNext];
+    textNext = (textNext + 1) % (int) SDL_arraysize(textCache);
+    if (e->tex) SDL_DestroyTexture(e->tex);
+    SDL_free(e->str);
+    *e = (TextEntry) {f, SDL_strdup(s), tex, tw, th};
+    return e;
+}
+
+/* Render text; returns width. Anchors top-left unless centered in [x,x+boxW]. */
+static float Text(SDL_Renderer *r, TTF_Font *f, const char *s, float x, float y,
+                  SDL_Color col, float boxW) {
+    TextEntry *e = TextTexture(r, f, s);
+    if (!e) return 0;
+    /* Centering a string wider than its box would start it off screen. */
+    if (boxW > 0 && e->w < boxW) x += (boxW - e->w) / 2;
+    SDL_SetTextureColorMod(e->tex, col.r, col.g, col.b);
+    SDL_SetTextureAlphaMod(e->tex, col.a);
+    SDL_FRect dst = {SDL_floorf(x + 0.5f), SDL_floorf(y + 0.5f), e->w, e->h};
+    SDL_RenderTexture(r, e->tex, NULL, &dst);
+    return e->w;
 }
 
 /* Dispatch face buttons by printed LABEL, not position, so Nintendo/8BitDo
@@ -438,35 +474,12 @@ static int MenuMove(int focus, int dx, int dy, int n) {
 }
 
 /* ---- pairing screen ---- */
-typedef struct { volatile bool done, ok; } PairState;
-
-static void POnSuccess(IHS_Client *c, const IHS_HostInfo *h, uint64_t steamId, void *ctx) {
-    (void) h; (void) steamId;
-    PairState *s = ctx; s->ok = true; s->done = true;
-    IHS_ClientStop(c);
-}
-static void POnFailed(IHS_Client *c, const IHS_HostInfo *h, IHS_AuthorizationResult r, void *ctx) {
-    (void) h; (void) r;
-    PairState *s = ctx; s->done = true;
-    IHS_ClientStop(c);
-}
-static void POnProgress(IHS_Client *c, const IHS_HostInfo *h, void *ctx) { (void) c; (void) h; (void) ctx; }
-
-bool PairScreen(SDL_Renderer *renderer, const IHS_ClientConfig *config,
-                const IHS_HostInfo *host) {
-    /* Not SDL_IOFromFile: it rejects character devices ("/dev/urandom is not a
-     * regular file or pipe"), so the read never happened and every PIN came out
-     * 0000. PlumeMakePin uses plain fopen, which is why the libretro core was
-     * never affected. */
+bool PairScreen(SDL_Renderer *renderer, const IHS_HostInfo *host) {
     char pin[5];
     PlumeMakePin(pin);
 
-    IHS_Client *client = IHS_ClientCreate(config);
-    PairState st = {0};
-    IHS_ClientAuthorizationCallbacks cb = {.progress = POnProgress, .success = POnSuccess, .failed = POnFailed};
-    IHS_ClientSetAuthorizationCallbacks(client, &cb, &st);
-    IHS_ClientStartDiscovery(client, 0);              /* keep the worker thread alive */
-    IHS_ClientAuthorizationRequest(client, host, pin);
+    PlumePairing pairing;
+    if (!PlumePairStart(&pairing, host, pin)) return false;
 
     /* Open connected gamepads so "B" can cancel on a controller-only device. */
     SDL_Gamepad *pads[8]; int np = 0;
@@ -478,7 +491,7 @@ bool PairScreen(SDL_Renderer *renderer, const IHS_ClientConfig *config,
     SDL_snprintf(line, sizeof(line), "Pairing with %s", host->hostname);
 
     bool cancelled = false;
-    while (!st.done && !cancelled) {
+    while (!SDL_GetAtomicInt(&pairing.done) && !cancelled) {
         SDL_Event e;
         while (SDL_PollEvent(&e)) {
             if (e.type == SDL_EVENT_QUIT ||
@@ -499,11 +512,8 @@ bool PairScreen(SDL_Renderer *renderer, const IHS_ClientConfig *config,
     }
 
     for (int i = 0; i < np; i++) if (pads[i]) SDL_CloseGamepad(pads[i]);
-    IHS_ClientStopDiscovery(client);
-    IHS_ClientStop(client);
-    IHS_ClientThreadedJoin(client);
-    IHS_ClientDestroy(client);
-    return st.ok;
+    /* Safe before `done`: that's the documented way to abort an unapproved pair. */
+    return PlumePairFinish(&pairing) && !cancelled;
 }
 
 /* ---- menu ---- */

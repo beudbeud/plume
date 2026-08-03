@@ -45,7 +45,7 @@ static int DoPair(const IHS_HostInfo *host) {
 
     PlumePairing p;
     if (!PlumePairStart(&p, host, pin)) return 1;
-    while (!p.done) SDL_Delay(100); /* nothing to draw here; just wait it out */
+    while (!SDL_GetAtomicInt(&p.done)) SDL_Delay(100); /* nothing to draw here; just wait it out */
     return PlumePairFinish(&p) ? 0 : 1;
 }
 
@@ -59,8 +59,7 @@ static void OnDisconnected(IHS_Session *s, void *ctx) { (void)s;(void)ctx; g_run
  * backend otherwise only reaches from GAMEPAD_ADDED events (sdl_hid_event.c). By
  * the time we stream, those fired at SDL_Init and the launcher menu ate them, so
  * a pad plugged in before launch is never announced and the host sees no
- * controller. Ask for the enumeration once the control channel is up, the way the
- * libretro core does. */
+ * controller. Ask for the enumeration once the control channel is up. */
 static void OnConnected(IHS_Session *s, void *ctx) {
     (void) ctx;
     IHS_SessionHIDNotifyDeviceChange(s);
@@ -140,7 +139,8 @@ static bool ForwardInput(IHS_Session *s, const SDL_Event *e) {
     switch (e->type) {
         case SDL_EVENT_MOUSE_MOTION:
             SDL_GetWindowSize(g_window, &w, &h);
-            IHS_SessionSendMousePosition(s, e->motion.x / w, e->motion.y / h);
+            /* 0x0 during a mode switch would send inf/nan to the host. */
+            if (w > 0 && h > 0) IHS_SessionSendMousePosition(s, e->motion.x / w, e->motion.y / h);
             break;
         case SDL_EVENT_MOUSE_BUTTON_DOWN:
             IHS_SessionSendMouseDown(s, MapButton(e->button.button));
@@ -191,7 +191,7 @@ static int DoStream(const IHS_HostInfo *host, bool audio) {
     if (!PlumeRequestStream(host, g_width, g_height, g_desktop, PlumeCountGamepads(), &sinfo, &res)) {
         /* Not paired yet -> pair from the UI, then retry once. */
         if (res != IHS_StreamingUnauthorized) return 1;
-        if (!PairScreen(g_renderer, &PlumeClientConfig, host)) return 1;
+        if (!PairScreen(g_renderer, host)) return 1;
         if (!PlumeRequestStream(host, g_width, g_height, g_desktop, PlumeCountGamepads(), &sinfo, &res)) return 1;
     }
 

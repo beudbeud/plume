@@ -1,5 +1,4 @@
-/* Shared IHSlib plumbing — see ihs.h. Lifted verbatim out of main.c when the
- * libretro core needed the same discovery/pairing identity. */
+/* Shared IHSlib plumbing — see ihs.h. */
 #define _GNU_SOURCE      /* gethostname, mkdir, dladdr, ucontext_t */
 #include <stdio.h>
 #include <stdlib.h>
@@ -68,7 +67,12 @@ void PlumeInitCreds(void) {
         int fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0600);
         FILE *w = fd >= 0 ? fdopen(fd, "wb") : NULL;
         if (w) { fwrite(&g_deviceId, 8, 1, w); fwrite(g_secretKey, 32, 1, w); fclose(w); }
-        else if (fd >= 0) close(fd);
+        else {
+            /* Silent failure here means a fresh identity — and a re-pair — on
+             * every launch, with nothing pointing at the disk or the perms. */
+            fprintf(stderr, "warning: cannot write %s: pairing will not survive a restart\n", path);
+            if (fd >= 0) close(fd);
+        }
     }
     if (gethostname(g_deviceName, sizeof(g_deviceName)) != 0)
         strcpy(g_deviceName, "plume");
@@ -118,6 +122,8 @@ void PlumeInstallCrashHandler(void) {
     sigaction(SIGSEGV, &sa, NULL);
     sigaction(SIGABRT, &sa, NULL);
     sigaction(SIGBUS, &sa, NULL);
+    sigaction(SIGILL, &sa, NULL);
+    sigaction(SIGFPE, &sa, NULL);
 }
 
 /* The last two are CRT modes: 15 kHz cannot scan 480 progressive lines at 60 Hz,
@@ -160,13 +166,13 @@ void PlumeLog(IHS_LogLevel level, const char *tag, const char *message) {
 /* --------------------- discovery: pick a host ----------------------------- */
 typedef struct {
     const char *wantIp;   /* NULL = accept first */
-    bool found;
+    SDL_AtomicInt found;  /* set (with its barrier) after host — arm64 reorders plain stores */
     IHS_HostInfo host;
 } HostPick;
 
 static void OnDiscovered(IHS_Client *client, const IHS_HostInfo *info, void *ctx) {
     HostPick *p = ctx;
-    if (p->found) return;
+    if (SDL_GetAtomicInt(&p->found)) return;
     if (p->wantIp) {
         char *ip = IHS_IPAddressToString(&info->address.ip);
         bool match = ip && strcmp(ip, p->wantIp) == 0;
@@ -174,25 +180,27 @@ static void OnDiscovered(IHS_Client *client, const IHS_HostInfo *info, void *ctx
         if (!match) return;
     }
     p->host = *info;
-    p->found = true;
+    SDL_SetAtomicInt(&p->found, 1);
     if (PlumeVerbose) printf("Found host: %s\n", info->hostname);
     IHS_ClientStop(client);
 }
 
 bool PlumeDiscoverHost(const char *wantIp, int timeoutSec, IHS_HostInfo *out) {
     IHS_Client *client = IHS_ClientCreate(&PlumeClientConfig);
+    if (!client) return false;
     IHS_ClientSetLogFunction(client, PlumeLog);
     HostPick pick = {.wantIp = wantIp};
     IHS_ClientDiscoveryCallbacks cb = {.discovered = OnDiscovered};
     IHS_ClientSetDiscoveryCallbacks(client, &cb, &pick);
     IHS_ClientStartDiscovery(client, 1000);
-    for (int i = 0; i < timeoutSec * 10 && !pick.found; i++) SDL_Delay(100);
+    for (int i = 0; i < timeoutSec * 10 && !SDL_GetAtomicInt(&pick.found); i++) SDL_Delay(100);
     IHS_ClientStopDiscovery(client);
     IHS_ClientStop(client);
     IHS_ClientThreadedJoin(client);
     IHS_ClientDestroy(client);
-    if (pick.found) *out = pick.host;
-    return pick.found;
+    if (!SDL_GetAtomicInt(&pick.found)) return false;
+    *out = pick.host;
+    return true;
 }
 
 /* ------------------------------- pairing ---------------------------------- */
@@ -200,14 +208,14 @@ static void OnAuthSuccess(IHS_Client *c, const IHS_HostInfo *h, uint64_t steamId
     (void) h;
     printf("Paired (steamId=%llu)\n", (unsigned long long) steamId);
     PlumePairing *p = ctx;
-    p->ok = true;
-    p->done = true;
+    SDL_SetAtomicInt(&p->ok, 1);
+    SDL_SetAtomicInt(&p->done, 1);
     IHS_ClientStop(c);
 }
 static void OnAuthFailed(IHS_Client *c, const IHS_HostInfo *h, IHS_AuthorizationResult r, void *ctx) {
     (void) h;
     fprintf(stderr, "Pairing failed (result=%d)\n", r);
-    ((PlumePairing *) ctx)->done = true;
+    SDL_SetAtomicInt(&((PlumePairing *) ctx)->done, 1);
     IHS_ClientStop(c);
 }
 static void OnAuthProgress(IHS_Client *c, const IHS_HostInfo *h, void *ctx) { (void)c;(void)h;(void)ctx; }
@@ -245,7 +253,7 @@ bool PlumePairFinish(PlumePairing *p) {
     IHS_ClientStopDiscovery(p->client);
     IHS_ClientDestroy(p->client);
     p->client = NULL;
-    return p->ok;
+    return SDL_GetAtomicInt(&p->ok) != 0;
 }
 
 /* -------------------- streaming request -> session info ------------------- */
@@ -284,6 +292,10 @@ static void OnStreamProgress(IHS_Client *c, const IHS_HostInfo *h, void *ctx) { 
 bool PlumeRequestStream(const IHS_HostInfo *host, int maxWidth, int maxHeight, bool desktop,
                         int gamepadCount, IHS_SessionInfo *out, IHS_StreamingResult *result) {
     IHS_Client *client = IHS_ClientCreate(&PlumeClientConfig);
+    if (!client) {
+        if (result) *result = IHS_StreamingFailed;
+        return false;
+    }
     IHS_ClientSetLogFunction(client, PlumeLog);
     StreamReq req = {0};
     IHS_ClientStreamingCallbacks cb = {

@@ -59,31 +59,6 @@ resumes automatically once approved. (`--pair` does the same headlessly.)
 Leave a running stream with **Hotkey + Start** on the gamepad (Hotkey = Guide/Home,
 or Select if the pad has no Guide), or Esc on the keyboard.
 
-## libretro core
-
-The same decode and session code also builds as `build/plume_libretro.so`, so
-RetroArch can stream a Steam host like any other core. Off by default:
-
-```sh
-cmake -B build -DCMAKE_BUILD_TYPE=Release -DPLUME_LIBRETRO=ON
-cmake --build build -j
-```
-
-Copy it and `plume_libretro.info` next to your other cores.
-
-Start it with no content to stream from the first host on the LAN, or load a
-`.plume` file whose first line is the host's IP. An unpaired host makes the core
-show a PIN as a frontend message and wait 90 s for Steam to approve it, then the
-stream starts on its own — no `plume --pair` needed.
-
-`-DPLUME_APP=OFF` builds the core alone, dropping SDL_ttf and the font the
-launcher needs. That is what the Recalbox package does.
-
-Resolution, audio, desktop mode and HEVC are core options (read once, at load —
-they are negotiated with the host). Gamepads reach the host through the same HID
-channel the standalone client uses; the mouse is forwarded, the keyboard is not.
-Frames are converted to XRGB8888 for the frontend, one full-frame pass each.
-
 ## Settings
 
 The **≡** screen writes `~/.local/share/plume/settings.conf` (plain
@@ -176,8 +151,8 @@ survive a rebase onto upstream:
   on the timer thread, so a slow handshake lets the device list race ahead of the
   authentication request; the host accepts that early `RemoteHID` and then never
   answers, and the session dies mid-negotiation. New `IHS_SessionStreaming()`
-  (`connectionState == Connected`) gates it. Surfaces from a libretro front-end,
-  where video init delays the handshake past the first HID tick.
+  (`connectionState == Connected`) gates it. Surfaced under a libretro front-end
+  (since removed), where video init delayed the handshake past the first HID tick.
 - **`session/channels/channel.c`** — a fragmented outgoing frame is now numbered
   the way the receiving window reads it back. The head carried `size/limit + 1`
   where the window expects `1 + head->fragmentId` fragments *after* the head (one

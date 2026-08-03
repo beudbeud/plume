@@ -17,23 +17,9 @@ typedef enum {
     MEDIA_SCALE_CROP,    /* fills, no distortion, edges cut off */
 } MediaScale;
 
-/* Borrow the shared window/renderer for one streaming session. Both NULL puts
- * media in headless mode: no window, no audio device, and the frames and samples
- * are pulled instead of presented (that's what the libretro core does). */
+/* Borrow the shared window/renderer for one streaming session. */
 void MediaAttach(SDL_Window *window, SDL_Renderer *renderer, bool enableAudio, MediaScale scale);
 void MediaDetach(void);
 
 /* Present the most-recently decoded frame. Call from the main thread. */
 void MediaPresent(void);
-
-/* ---- headless mode only ---- */
-
-/* Scale the newest decoded frame into a fixed dstW x dstH XRGB8888 image at
- * `pixels`, `pitch` bytes per row, letterboxed. False when nothing new was
- * decoded since the last call (dup the frame). Fixed output matters: the host
- * changes the streamed aspect ratio whenever its captured window changes, and a
- * frontend told to re-fit its display each time will thrash. */
-bool MediaPullVideo(void *pixels, int pitch, int dstW, int dstH);
-
-/* Drain up to `maxFrames` stereo S16 frames. Returns frames written. */
-int MediaPullAudio(int16_t *out, int maxFrames);

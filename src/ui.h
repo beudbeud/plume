@@ -33,5 +33,4 @@ UIAction RunMenu(SDL_Window *window, SDL_Renderer *renderer,
 
 /* Full-screen pairing prompt: shows a PIN to type into Steam on the host and
  * waits for approval. Returns true once paired, false on cancel/failure. */
-bool PairScreen(SDL_Renderer *renderer, const IHS_ClientConfig *config,
-                const IHS_HostInfo *host);
+bool PairScreen(SDL_Renderer *renderer, const IHS_HostInfo *host);
