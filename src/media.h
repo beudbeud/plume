@@ -23,3 +23,10 @@ void MediaDetach(void);
 
 /* Present the most-recently decoded frame. Call from the main thread. */
 void MediaPresent(void);
+
+/* Toggle the in-stream stats HUD (resolution, fps, bitrate, decode time). */
+void MediaToggleStats(void);
+
+/* When MediaPresent last showed a new frame (SDL ticks, ns; 0 = none yet).
+ * Feeds the link-death watchdog: IHSlib has no receive-side keepalive. */
+Uint64 MediaLastFrameNS(void);

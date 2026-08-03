@@ -39,3 +39,12 @@ target_include_directories(plume PRIVATE ${SDL3_INCLUDE_DIRS} ${FFMPEG_INCLUDE_D
 # through the HID channel.
 target_link_libraries(plume PRIVATE ihslib ihslib-hid-sdl ${SDL3_LIBRARIES} ${FFMPEG_LIBRARIES})
 target_compile_options(plume PRIVATE ${SDL3_CFLAGS_OTHER} ${FFMPEG_CFLAGS_OTHER})
+
+# Self-checks for the pure plumbing (ihs.c). IHSlib's own tests only build when
+# it is the top-level project — run them from a standalone IHSlib build.
+enable_testing()
+add_executable(plume_tests tests/test_plume.c src/ihs.c)
+target_include_directories(plume_tests PRIVATE src ${SDL3_INCLUDE_DIRS})
+target_link_libraries(plume_tests PRIVATE ihslib ${SDL3_LIBRARIES})
+target_compile_options(plume_tests PRIVATE ${SDL3_CFLAGS_OTHER})
+add_test(NAME plume COMMAND plume_tests)

@@ -1,0 +1,30 @@
+# Build + test on both target architectures. Debian trixie container because the
+# Ubuntu LTS runners don't package SDL3 yet.
+name: build
+on: [push, pull_request]
+
+jobs:
+  build:
+    strategy:
+      matrix:
+        runner: [ubuntu-latest, ubuntu-24.04-arm]
+    runs-on: ${{ matrix.runner }}
+    container: debian:trixie
+    steps:
+      - name: Install dependencies
+        run: |
+          apt-get update
+          apt-get install -y --no-install-recommends git ca-certificates \
+            cmake pkg-config build-essential \
+            libsdl3-dev libsdl3-ttf-dev \
+            libavcodec-dev libavutil-dev libswscale-dev libswresample-dev \
+            libprotobuf-c-dev libmbedtls-dev
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - name: Configure
+        run: cmake -B build -DCMAKE_BUILD_TYPE=Release
+      - name: Build
+        run: cmake --build build -j
+      - name: Test
+        run: ctest --test-dir build --output-on-failure

@@ -1,5 +1,7 @@
 # <img src="assets/logo.svg" height="56" align="center" alt=""> Plume
 
+[![build](https://github.com/beudbeud/plume/actions/workflows/build.yml/badge.svg)](https://github.com/beudbeud/plume/actions/workflows/build.yml)
+
 A lightweight Steam Remote Play client in C, with SDL3 and FFmpeg.
 
 Plume discovers Steam hosts on the LAN, decodes their H264 video and Opus audio
@@ -37,6 +39,8 @@ falls back to fetching *upstream* IHSlib — which builds, and then misbehaves.
 An existing clone catches up with `git submodule update --init`.
 
 Build natively on each architecture (or cross-compile with an aarch64 toolchain).
+CI builds and tests both on every push. `ctest --test-dir build` runs plume's
+self-checks; IHSlib's own tests need a standalone IHSlib build.
 
 ## Use
 
@@ -57,7 +61,13 @@ Steam on the host (`Settings → Remote Play → Pair Steam Link app`), and stre
 resumes automatically once approved. (`--pair` does the same headlessly.)
 
 Leave a running stream with **Hotkey + Start** on the gamepad (Hotkey = Guide/Home,
-or Select if the pad has no Guide), or Esc on the keyboard.
+or Select if the pad has no Guide), or Esc on the keyboard. **Hotkey + Y** (or F3)
+toggles a stats overlay: resolution, codec, fps, bitrate, decode time, dropped
+frames.
+
+If the stream drops without you asking — a Wi-Fi blip, a host hiccup — plume
+requests a fresh session from the host and resumes on its own, up to five tries.
+Esc or B during the countdown returns to the launcher instead.
 
 ## Settings
 
@@ -67,6 +77,7 @@ The **≡** screen writes `~/.local/share/plume/settings.conf` (plain
 | Setting | Values | Notes |
 |---|---|---|
 | Resolution | 240p / 480p / 720p / 1080p | See the caveat below |
+| Bitrate | 2–30 Mbps | Left/Right overrides; **A** snaps back to the resolution's tuned default, shown as `(auto)`. The host still adapts downward under this cap on a weak link |
 | Scaling | Fit / Stretch / Crop | Fit letterboxes, Stretch distorts, Crop fills and cuts edges |
 | Desktop mode | On / Off | Off asks the host for Big Picture instead of the desktop |
 | HEVC video | On / Off | Only takes effect if the host offers codec 5 — see below |

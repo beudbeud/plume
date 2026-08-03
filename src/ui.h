@@ -26,6 +26,13 @@ typedef struct {
 bool UIEnsureFonts(SDL_Renderer *renderer);
 void UICloseFonts(void);
 
+/* One centered message on the menu gradient, presented immediately. */
+void UIMessage(SDL_Renderer *r, const char *text);
+
+/* One line top-left with a dark backing, drawn into the current frame (no
+ * present) — the in-stream stats HUD. */
+void UIDrawOverlay(SDL_Renderer *r, const char *text);
+
 /* Runs the launcher. Uses the shared client config for LAN discovery.
  * Returns UI_START (out->host filled) or UI_QUIT. */
 UIAction RunMenu(SDL_Window *window, SDL_Renderer *renderer,

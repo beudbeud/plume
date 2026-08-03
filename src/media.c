@@ -16,6 +16,8 @@
 #include <libavutil/hwcontext.h>
 #include <libavutil/pixdesc.h>
 
+#include "ui.h" /* UIDrawOverlay: the stats HUD borrows the launcher's fonts */
+
 /* ---- SDL window / renderer (borrowed from main.c) ---- */
 static SDL_Window *window;
 static SDL_Renderer *renderer;
@@ -46,6 +48,34 @@ static uint16_t pendingFrameId;
 
 static MediaScale scaleMode;
 
+/* ---- stats overlay (F3 / Hotkey+Y) ----
+ * The decode thread bumps the atomics; MediaPresent snapshots them once per
+ * second into statsLine. Survives a reconnect: only the counters reset. */
+static bool statsOn;
+static char statsCodec[48];    /* "h264 sw", set once in VideoStart */
+static char statsLine[160];
+static Uint64 statsT0;
+static int statsShown;                /* frames presented this window (main thread) */
+static SDL_AtomicInt statsBytes;      /* video payload in */
+static SDL_AtomicInt statsDecoded;    /* frames out of the decoder */
+static SDL_AtomicInt statsDecodeUs;   /* serialized decode time (see the README note) */
+static SDL_AtomicInt statsDropped;    /* cumulative latch overwrites */
+
+void MediaToggleStats(void) {
+    statsOn = !statsOn;
+    statsLine[0] = '\0';
+    statsT0 = 0; /* restart the 1 s window on the next present */
+}
+
+/* Main thread only: last time MediaPresent showed a NEW frame (0 = none yet).
+ * The link-death watchdog in main.c reads this — IHSlib has no receive-side
+ * keepalive, so a hard drop otherwise freezes the picture forever. */
+static Uint64 lastFrameNs;
+
+Uint64 MediaLastFrameNS(void) {
+    return lastFrameNs;
+}
+
 /* ---- Audio decode (network thread -> SDL queue) ---- */
 static bool audioEnabled;
 static SDL_AudioStream *audioStream;
@@ -65,6 +95,13 @@ void MediaAttach(SDL_Window *w, SDL_Renderer *r, bool enableAudio, MediaScale sc
     latched = av_frame_alloc();
     consumed = av_frame_alloc();
     frameDirty = false;
+    statsT0 = 0;
+    statsShown = 0;
+    lastFrameNs = 0;
+    SDL_SetAtomicInt(&statsBytes, 0);
+    SDL_SetAtomicInt(&statsDecoded, 0);
+    SDL_SetAtomicInt(&statsDecodeUs, 0);
+    SDL_SetAtomicInt(&statsDropped, 0);
 }
 
 void MediaDetach(void) {
@@ -175,6 +212,7 @@ static int VideoStart(IHS_Session *session, const IHS_StreamVideoConfig *config,
         }
         if (avcodec_open2(vctx, codec, NULL) == 0) {
             SDL_Log("video decoder: %s (%s)", codec->name, useHw ? "hardware" : "software");
+            SDL_snprintf(statsCodec, sizeof(statsCodec), "%s %s", codec->name, useHw ? "hw" : "sw");
             return 0;
         }
         avcodec_free_context(&vctx);
@@ -201,8 +239,10 @@ static void StashFrame(AVFrame *src, uint16_t frameId) {
     SDL_UnlockMutex(frameLock);
 
     if (hadPending) {
+        SDL_AddAtomicInt(&statsDropped, 1);
         IHS_SessionReportVideoFrameComplete(statsSession, dropped, IHS_VideoFrameResultDroppedLate);
     }
+    SDL_AddAtomicInt(&statsDecoded, 1);
 }
 
 /* Move the newest frame out of the latch, so the conversion that follows — a
@@ -283,6 +323,7 @@ static IHS_StreamVideoSubmitResult VideoSubmit(IHS_Session *session, uint16_t fr
         return IHS_StreamVideoSubmitReportLost;
     }
     memcpy(vpkt->data, IHS_BufferPointer(data), data->size);
+    SDL_AddAtomicInt(&statsBytes, (int) data->size);
     IHS_StreamVideoSubmitResult ret = IHS_StreamVideoSubmitOK;
     Uint64 t0 = SDL_GetTicksNS();
     IHS_SessionReportVideoFrameStage(session, frameId, IHS_VideoFrameStageDecodeBegin, 0);
@@ -306,6 +347,7 @@ static IHS_StreamVideoSubmitResult VideoSubmit(IHS_Session *session, uint16_t fr
     /* Decode runs inline on the session worker thread, so >16ms here starves
      * audio too and overflows the video ring. Report the average periodically. */
     static Uint64 accNs; static int accN;
+    SDL_AddAtomicInt(&statsDecodeUs, (int) ((SDL_GetTicksNS() - t0) / 1000));
     accNs += SDL_GetTicksNS() - t0;
     if (++accN == 120) {
         SDL_Log("decode: %.1f ms/frame avg", (double) accNs / accN / 1e6);
@@ -346,6 +388,8 @@ void MediaPresent(void) {
                                  f->data[2], f->linesize[2]);
         }
         IHS_SessionReportVideoFrameStage(statsSession, shownId, IHS_VideoFrameStageUploadEnd, 0);
+        statsShown++;
+        lastFrameNs = SDL_GetTicksNS();
     }
 
     SDL_RenderClear(renderer);
@@ -365,6 +409,23 @@ void MediaPresent(void) {
             dst.y = (oh - dst.h) / 2;
             SDL_RenderTexture(renderer, texture, NULL, &dst);
         }
+    }
+    if (statsOn) {
+        Uint64 now = SDL_GetTicksNS();
+        if (statsT0 == 0) { statsT0 = now; statsShown = 0; }
+        if (now - statsT0 >= 1000000000ull) {
+            float dt = (float) (now - statsT0) / 1e9f;
+            int bytes = SDL_SetAtomicInt(&statsBytes, 0); /* returns the old value */
+            int dec = SDL_SetAtomicInt(&statsDecoded, 0);
+            int us = SDL_SetAtomicInt(&statsDecodeUs, 0);
+            SDL_snprintf(statsLine, sizeof(statsLine),
+                         "%dx%d %s | %.0f fps | %.1f Mbps | dec %.1f ms | drop %d",
+                         texW, texH, statsCodec, statsShown / dt, bytes * 8.0f / dt / 1e6f,
+                         dec > 0 ? us / 1000.0f / dec : 0.0f, SDL_GetAtomicInt(&statsDropped));
+            statsShown = 0;
+            statsT0 = now;
+        }
+        if (statsLine[0]) UIDrawOverlay(renderer, statsLine);
     }
     SDL_RenderPresent(renderer);
 

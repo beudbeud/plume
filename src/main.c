@@ -166,41 +166,40 @@ static bool ForwardInput(IHS_Session *s, const SDL_Event *e) {
     return false;
 }
 
-/* Hotkey + Start leaves the stream. Hotkey is Guide (Home) or Back (Select) —
- * 8BitDo pads label these differently, and some have no Guide at all. Polled
- * rather than event-driven: we need both buttons held at the same instant, and
- * the presses are also forwarded to the host as normal HID input. */
+/* Hotkey = Guide (Home) or Back (Select) — 8BitDo pads label these differently,
+ * and some have no Guide at all. */
+static bool HotkeyHeld(SDL_JoystickID id) {
+    SDL_Gamepad *g = SDL_GetGamepadFromID(id); /* opened by the HID provider */
+    return g && (SDL_GetGamepadButton(g, SDL_GAMEPAD_BUTTON_GUIDE) ||
+                 SDL_GetGamepadButton(g, SDL_GAMEPAD_BUTTON_BACK));
+}
+
+/* Hotkey + Start leaves the stream. Polled rather than event-driven: we need
+ * both buttons held at the same instant, and the presses are also forwarded to
+ * the host as normal HID input. */
 static bool QuitComboHeld(void) {
     int n;
     SDL_JoystickID *ids = SDL_GetGamepads(&n);
     if (!ids) return false;
     bool held = false;
     for (int i = 0; i < n && !held; i++) {
-        SDL_Gamepad *g = SDL_GetGamepadFromID(ids[i]); /* opened by the HID provider */
-        if (!g || !SDL_GetGamepadButton(g, SDL_GAMEPAD_BUTTON_START)) continue;
-        held = SDL_GetGamepadButton(g, SDL_GAMEPAD_BUTTON_GUIDE) ||
-               SDL_GetGamepadButton(g, SDL_GAMEPAD_BUTTON_BACK);
+        SDL_Gamepad *g = SDL_GetGamepadFromID(ids[i]);
+        held = g && SDL_GetGamepadButton(g, SDL_GAMEPAD_BUTTON_START) && HotkeyHeld(ids[i]);
     }
     SDL_free(ids);
     return held;
 }
 
-static int DoStream(const IHS_HostInfo *host, bool audio) {
-    IHS_SessionInfo sinfo;
-    IHS_StreamingResult res;
-    if (!PlumeRequestStream(host, g_width, g_height, g_desktop, PlumeCountGamepads(), &sinfo, &res)) {
-        /* Not paired yet -> pair from the UI, then retry once. */
-        if (res != IHS_StreamingUnauthorized) return 1;
-        if (!PairScreen(g_renderer, host)) return 1;
-        if (!PlumeRequestStream(host, g_width, g_height, g_desktop, PlumeCountGamepads(), &sinfo, &res)) return 1;
-    }
+/* One connected session, start to finish. */
+typedef enum { SESSION_FAILED, SESSION_USER_QUIT, SESSION_DROPPED } SessionEnd;
 
+static SessionEnd RunSession(const IHS_SessionInfo *sinfo, bool audio) {
     MediaAttach(g_window, g_renderer, audio, (MediaScale) g_scale);
 
     g_running = true; /* reset: OnDisconnected clears it */
     IHS_StreamSessionCallbacks scb = {.configuring = OnConfiguring, .connected = OnConnected,
                                       .disconnected = OnDisconnected};
-    IHS_Session *session = IHS_SessionCreate(&PlumeClientConfig, &sinfo);
+    IHS_Session *session = IHS_SessionCreate(&PlumeClientConfig, sinfo);
     IHS_SessionSetLogFunction(session, PlumeLog);
     IHS_SessionSetSessionCallbacks(session, &scb, NULL);
     IHS_SessionSetVideoCallbacks(session, &VideoCallbacks, NULL);
@@ -216,10 +215,12 @@ static int DoStream(const IHS_HostInfo *host, bool audio) {
         IHS_SessionDestroy(session);
         IHS_HIDProviderSDLDestroy(hid);
         MediaDetach();
-        return 1;
+        return SESSION_FAILED;
     }
 
     bool disconnecting = false;
+    bool stalled = false;
+    Uint64 sessionStart = SDL_GetTicksNS();
     while (g_running) {
         bool hidDirty = false;
         bool padButton = false;
@@ -228,6 +229,8 @@ static int DoStream(const IHS_HostInfo *host, bool audio) {
             if (e.type == SDL_EVENT_QUIT ||
                 (e.type == SDL_EVENT_KEY_DOWN && e.key.key == SDLK_ESCAPE)) {
                 if (!disconnecting) { IHS_SessionDisconnect(session); disconnecting = true; }
+            } else if (e.type == SDL_EVENT_KEY_DOWN && e.key.key == SDLK_F3) {
+                if (!e.key.repeat) MediaToggleStats(); /* ours; not forwarded */
             } else if (!disconnecting) {
                 /* Mid-stream (dis)appearance is the signature of a controller or USB
                  * hiccup — the one thing a "controls went dead" report can't show. */
@@ -235,6 +238,11 @@ static int DoStream(const IHS_HostInfo *host, bool audio) {
                     SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION, "gamepad %s mid-stream (id=%d)",
                                 e.type == SDL_EVENT_GAMEPAD_REMOVED ? "removed" : "added",
                                 (int) e.gdevice.which);
+                /* Hotkey + Y toggles the stats overlay (forwarded too, like the
+                 * quit combo — the host just sees a Y press). */
+                if (e.type == SDL_EVENT_GAMEPAD_BUTTON_DOWN &&
+                    e.gbutton.button == SDL_GAMEPAD_BUTTON_NORTH && HotkeyHeld(e.gbutton.which))
+                    MediaToggleStats();
                 padButton |= e.type == SDL_EVENT_GAMEPAD_BUTTON_DOWN;
                 hidDirty |= ForwardInput(session, &e);
             }
@@ -250,13 +258,77 @@ static int DoStream(const IHS_HostInfo *host, bool audio) {
             IHS_SessionHIDSendReport(session);
         }
         MediaPresent(); /* blocks on vsync, paces the loop */
+
+        /* IHSlib's keepalive only transmits — a hard link drop never fires
+         * disconnected(), the picture just freezes. The host streams frames
+         * continuously (even a static desktop), so a long silence IS the drop. */
+        if (!disconnecting) {
+            Uint64 last = MediaLastFrameNS();
+            if (last == 0) last = sessionStart; /* nothing decoded yet: count from connect */
+            if (SDL_GetTicksNS() - last > 8000000000ull) {
+                SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION, "no video for 8 s, dropping the session");
+                stalled = true;
+                break;
+            }
+        }
     }
+    /* Unacked StopRequest times out inside IHSlib (250 ms), so this returns
+     * promptly even when the host is gone. */
+    if (stalled) IHS_SessionDisconnect(session);
 
     IHS_SessionThreadedJoin(session);
     IHS_SessionDestroy(session); /* closes its devices, so destroy the provider after */
     IHS_HIDProviderSDLDestroy(hid);
     MediaDetach();
-    return 0;
+    return disconnecting ? SESSION_USER_QUIT : SESSION_DROPPED;
+}
+
+/* Show `msg` for `ms` while watching for a cancel (Esc, East button, quit).
+ * Returns false when the user cancelled. */
+static bool ReconnectWait(const char *msg, int ms) {
+    Uint64 until = SDL_GetTicks() + (Uint64) ms;
+    do {
+        SDL_Event e;
+        while (SDL_PollEvent(&e)) {
+            if (e.type == SDL_EVENT_QUIT ||
+                (e.type == SDL_EVENT_KEY_DOWN && e.key.key == SDLK_ESCAPE) ||
+                (e.type == SDL_EVENT_GAMEPAD_BUTTON_DOWN &&
+                 e.gbutton.button == SDL_GAMEPAD_BUTTON_EAST))
+                return false;
+        }
+        UIMessage(g_renderer, msg);
+        SDL_Delay(50);
+    } while (SDL_GetTicks() < until);
+    return true;
+}
+
+#define RECONNECT_TRIES 5
+
+static int DoStream(const IHS_HostInfo *host, bool audio) {
+    IHS_SessionInfo sinfo;
+    IHS_StreamingResult res;
+    if (!PlumeRequestStream(host, g_width, g_height, g_desktop, PlumeCountGamepads(), &sinfo, &res)) {
+        /* Not paired yet -> pair from the UI, then retry once. */
+        if (res != IHS_StreamingUnauthorized) return 1;
+        if (!PairScreen(g_renderer, host)) return 1;
+        if (!PlumeRequestStream(host, g_width, g_height, g_desktop, PlumeCountGamepads(), &sinfo, &res)) return 1;
+    }
+
+    for (;;) {
+        SessionEnd end = RunSession(&sinfo, audio);
+        if (end != SESSION_DROPPED) return end == SESSION_USER_QUIT ? 0 : 1;
+        /* The link died under us (Wi-Fi blip, host hiccup). The old grant is
+         * spent — ask the host for a fresh session and resume, a few times,
+         * before giving the user their menu back. */
+        bool got = false;
+        for (int i = 1; i <= RECONNECT_TRIES && !got; i++) {
+            char msg[64];
+            snprintf(msg, sizeof(msg), "Connection lost - reconnecting (%d/%d)...", i, RECONNECT_TRIES);
+            if (!ReconnectWait(msg, i == 1 ? 500 : 2000)) return 0; /* user cancelled */
+            got = PlumeRequestStream(host, g_width, g_height, g_desktop, PlumeCountGamepads(), &sinfo, NULL);
+        }
+        if (!got) return 1;
+    }
 }
 
 /* -------------------------------- main ------------------------------------ */

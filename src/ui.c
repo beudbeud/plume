@@ -274,6 +274,32 @@ static TextEntry *TextTexture(SDL_Renderer *r, TTF_Font *f, const char *s) {
     return e;
 }
 
+static float Text(SDL_Renderer *r, TTF_Font *f, const char *s, float x, float y,
+                  SDL_Color col, float boxW);
+
+/* One centered line on the gradient, presented — feedback for blocking waits
+ * (reconnection) that have no screen of their own. */
+void UIMessage(SDL_Renderer *r, const char *text) {
+    if (!UIEnsureFonts(r)) return;
+    int W, H;
+    SDL_GetRenderOutputSize(r, &W, &H);
+    Gradient(r, W, H);
+    Text(r, uiFont, text, 0, H * 0.47f, (SDL_Color) {255, 255, 255, 255}, W);
+    SDL_RenderPresent(r);
+}
+
+/* One line, top-left, dark backing — the in-stream stats HUD. */
+void UIDrawOverlay(SDL_Renderer *r, const char *text) {
+    if (!text[0] || !UIEnsureFonts(r)) return;
+    TextEntry *e = TextTexture(r, uiFontSmall, text);
+    if (!e) return;
+    float p = e->h * 0.35f;
+    SDL_SetRenderDrawBlendMode(r, SDL_BLENDMODE_BLEND);
+    FillRect(r, 0, 0, e->w + 2 * p, e->h + 2 * p, 8, 20, 35, 190);
+    SDL_SetRenderDrawBlendMode(r, SDL_BLENDMODE_NONE);
+    Text(r, uiFontSmall, text, p, p, (SDL_Color) {255, 255, 255, 255}, 0);
+}
+
 /* Render text; returns width. Anchors top-left unless centered in [x,x+boxW]. */
 static float Text(SDL_Renderer *r, TTF_Font *f, const char *s, float x, float y,
                   SDL_Color col, float boxW) {
@@ -344,12 +370,17 @@ static bool NavPoll(NavState *s, SDL_Gamepad *pad, int *dx, int *dy) {
 }
 
 /* ---- settings screen ---- */
+/* Presets the Bitrate row steps through. Picking a resolution snaps the bitrate
+ * to that resolution's default; this row then overrides it. */
+static const int KBPS_STEPS[] = {2000, 3000, 5000, 8000, 10000, 15000, 20000, 30000};
+#define KBPS_N ((int) SDL_arraysize(KBPS_STEPS))
+
 /* Modal over the launcher. Up/Down picks a row, Left/Right or A changes it,
  * B/Escape returns. Edits the settings in place. */
-static void SettingsScreen(SDL_Renderer *renderer, SDL_Gamepad *pad, int *resIdx,
+static void SettingsScreen(SDL_Renderer *renderer, SDL_Gamepad *pad, int *resIdx, int *kbps,
                            bool *hevc, bool *audio, bool *desktop, int *scale) {
-    enum { ROW_RES, ROW_SCALING, ROW_DESKTOP, ROW_HEVC, ROW_AUDIO, ROW_BACK, ROW_N };
-    static const char *labels[ROW_N] = {"Resolution", "Scaling", "Desktop mode", "HEVC video", "Audio", "Back"};
+    enum { ROW_RES, ROW_BITRATE, ROW_SCALING, ROW_DESKTOP, ROW_HEVC, ROW_AUDIO, ROW_BACK, ROW_N };
+    static const char *labels[ROW_N] = {"Resolution", "Bitrate", "Scaling", "Desktop mode", "HEVC video", "Audio", "Back"};
     const SDL_Color white = {255, 255, 255, 255}, dim = {180, 195, 215, 255};
     int focus = 0;
     bool running = true;
@@ -361,7 +392,15 @@ static void SettingsScreen(SDL_Renderer *renderer, SDL_Gamepad *pad, int *resIdx
     /* Applies a left/right (or accept) step to the focused row. */
     #define APPLY(d) do { \
         switch (focus) { \
-            case ROW_RES: *resIdx = (*resIdx + (d) + RES_N) % RES_N; break; \
+            case ROW_RES: \
+                *resIdx = (*resIdx + (d) + RES_N) % RES_N; \
+                *kbps = RES[*resIdx].kbps; /* bitrate follows, until overridden below */ \
+                break; \
+            case ROW_BITRATE: { \
+                int k = 0; \
+                while (k < KBPS_N - 1 && KBPS_STEPS[k] < *kbps) k++; /* nearest slot at/above */ \
+                *kbps = KBPS_STEPS[(k + (d) + KBPS_N) % KBPS_N]; \
+            } break; \
             case ROW_SCALING: *scale = (*scale + (d) + SCALE_N) % SCALE_N; break; \
             case ROW_DESKTOP: *desktop = !*desktop; break; \
             case ROW_HEVC: *hevc = !*hevc; break; \
@@ -381,6 +420,7 @@ static void SettingsScreen(SDL_Renderer *renderer, SDL_Gamepad *pad, int *resIdx
         SDL_Event e;
         while (SDL_PollEvent(&e)) {
             int delta = 0;
+            bool accept = false;
             switch (e.type) {
                 case SDL_EVENT_QUIT: running = false; break;
                 case SDL_EVENT_KEY_DOWN:
@@ -389,18 +429,22 @@ static void SettingsScreen(SDL_Renderer *renderer, SDL_Gamepad *pad, int *resIdx
                         case SDLK_DOWN: if (focus < ROW_N - 1) focus++; break;
                         case SDLK_LEFT: delta = -1; break;
                         case SDLK_RIGHT: delta = 1; break;
-                        case SDLK_RETURN: case SDLK_SPACE: delta = 1; break;
+                        case SDLK_RETURN: case SDLK_SPACE: accept = true; break;
                         case SDLK_ESCAPE: running = false; break;
                         default: break;
                     }
                     break;
                 case SDL_EVENT_GAMEPAD_BUTTON_DOWN: /* directions come from NavPoll */
-                    if (BtnIsAccept(e.gbutton.which, e.gbutton.button)) delta = 1;
+                    if (BtnIsAccept(e.gbutton.which, e.gbutton.button)) accept = true;
                     else if (BtnIsBack(e.gbutton.which, e.gbutton.button)) running = false;
                     break;
                 default: break;
             }
-            if (delta != 0) APPLY(delta);
+            /* Accept on Bitrate = back to the resolution's tuned default (the
+             * "auto" button); everywhere else it just steps like Right. */
+            if (accept && focus == ROW_BITRATE) *kbps = RES[*resIdx].kbps;
+            else if (accept) APPLY(1);
+            else if (delta != 0) APPLY(delta);
         }
 
         UIEnsureFonts(renderer);
@@ -413,7 +457,7 @@ static void SettingsScreen(SDL_Renderer *renderer, SDL_Gamepad *pad, int *resIdx
         Gradient(renderer, W, H);
         Text(renderer, titleFont, "Settings", pad_, pad_ * 0.6f, white, 0);
 
-        float rowX = pad_, rowW = W - 2 * pad_, rowH = H * 0.11f, rowY = H * 0.24f;
+        float rowX = pad_, rowW = W - 2 * pad_, rowH = H * 0.09f, rowY = H * 0.19f;
         for (int i = 0; i < ROW_N; i++) {
             bool f = focus == i;
             FillRect(renderer, rowX, rowY, rowW, rowH, f ? 90 : 60, f ? 115 : 80, f ? 155 : 110, 235);
@@ -422,10 +466,15 @@ static void SettingsScreen(SDL_Renderer *renderer, SDL_Gamepad *pad, int *resIdx
             if (i == ROW_BACK) {
                 Text(renderer, font, labels[i], rowX, ty, white, rowW);
             } else {
-                char value[32];
+                char value[32], kbuf[16];
                 const char *text;
                 switch (i) {
                     case ROW_RES: text = RES[*resIdx].label; break;
+                    case ROW_BITRATE:
+                        SDL_snprintf(kbuf, sizeof(kbuf), *kbps == RES[*resIdx].kbps
+                                     ? "%d Mbps (auto)" : "%d Mbps", *kbps / 1000);
+                        text = kbuf;
+                        break;
                     case ROW_SCALING: text = SCALE_NAMES[*scale]; break;
                     case ROW_DESKTOP: text = *desktop ? "On" : "Off"; break;
                     case ROW_HEVC: text = *hevc ? "On" : "Off"; break;
@@ -549,6 +598,7 @@ UIAction RunMenu(SDL_Window *window, SDL_Renderer *renderer,
     const int resIdx0 = resIdx;
     bool hevc = out->hevc, audio = out->audio, desktop = out->desktop;
     int scale = out->scale;
+    int kbps = out->kbps;
 
     /* focus: 0 = Start tile, 1..n = host rows, n+1 = settings icon, n+2 = quit icon */
     int focus = 0;
@@ -619,7 +669,7 @@ UIAction RunMenu(SDL_Window *window, SDL_Renderer *renderer,
             activate:
             if (focus == FOCUS_QUIT) { action = UI_QUIT; running = false; break; }
             if (focus == FOCUS_SETTINGS) {
-                SettingsScreen(renderer, pad, &resIdx, &hevc, &audio, &desktop, &scale);
+                SettingsScreen(renderer, pad, &resIdx, &kbps, &hevc, &audio, &desktop, &scale);
                 nav = (NavState) {0}; /* the stick may still be held; don't carry it back */
                 break;
             }
@@ -659,9 +709,9 @@ UIAction RunMenu(SDL_Window *window, SDL_Renderer *renderer,
         Text(renderer, font, "Start Streaming", tileX, tileY + tileH * 0.72f, white, tileW);
 
         /* current settings, read-only under the Start tile */
-        char summary[64];
-        SDL_snprintf(summary, sizeof(summary), "%s  %s  %s  %s  %s", RES[resIdx].label,
-                     SCALE_NAMES[scale], desktop ? "Desktop" : "Game",
+        char summary[80];
+        SDL_snprintf(summary, sizeof(summary), "%s  %d Mbps  %s  %s  %s  %s", RES[resIdx].label,
+                     kbps / 1000, SCALE_NAMES[scale], desktop ? "Desktop" : "Game",
                      hevc ? "HEVC" : "H264", audio ? "Audio" : "Muted");
         Text(renderer, uiFontSmall, summary, tileX, tileY + tileH + pad_ * 0.4f, dim, tileW);
 
@@ -700,15 +750,16 @@ UIAction RunMenu(SDL_Window *window, SDL_Renderer *renderer,
     IHS_ClientDestroy(client);
     if (pad) SDL_CloseGamepad(pad);
 
-    /* Only the Resolution row owns these four. Writing them back unconditionally
-     * clobbered an fps or kbps hand-edited into settings.conf — and any resolution
-     * absent from RES, which the loop above resolves to 1080p. */
+    /* Only the Resolution row owns these three. Writing them back unconditionally
+     * clobbered an fps hand-edited into settings.conf — and any resolution absent
+     * from RES, which the loop above resolves to 1080p. kbps is owned by the
+     * Bitrate row now, so it always writes back. */
     if (resIdx != resIdx0) {
         out->width = RES[resIdx].w;
         out->height = RES[resIdx].h;
         out->fps = RES[resIdx].fps;
-        out->kbps = RES[resIdx].kbps;
     }
+    out->kbps = kbps;
     out->hevc = hevc;
     out->desktop = desktop;
     out->scale = scale;
