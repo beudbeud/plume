@@ -121,9 +121,9 @@ codec list. Steam's HEVC checkbox lives under *client* options — it says what
 that machine can decode, not what it will encode for you. The host log shows
 `Allowed Codecs: 4` and never mentions HEVC.
 
-Untested, and the only way to find out: a Windows host may well offer codec 5,
-in which case the Pi5's hardware path lights up on its own. Software H264 keeps
-1080p60 there comfortably either way.
+A Windows host does offer codec 5 (confirmed in the field), and the Pi5's
+hardware path lights up on its own. Software H264 keeps 1080p60 comfortable
+either way on that board.
 
 The Pi3 and Pi4 need their hardware decoder. Software H264 on a Cortex-A53 will
 not hold 1080p60, and the Pi3's VideoCore caps H264 at 1080p30 — expect 720p on
@@ -141,10 +141,12 @@ still keeps the decode thread lighter than before. Run with `--verbose` and look
 for the `zero-copy:` log lines to see which path you got. `PLUME_NO_ZEROCOPY=1`
 restores the old decode-thread readback entirely.
 
-Known ceiling: the Pi's SAND-tiled buffers import only if Mesa v3d accepts the
-`BROADCOM_SAND128` modifier for sampling; if it refuses, the fallback runs and
-the next step is a DRM overlay plane (the HVS scans out SAND natively), which is
-a bigger, KMSDRM-only build-out.
+Known ceiling: the Pi5's HEVC decoder emits Broadcom SAND-tiled buffers, and
+Mesa v3d *accepts* their EGL import but samples them as linear — the whole
+screen comes out pink. Tiled modifiers are therefore rejected up front and
+those frames take the readback path (the rpi FFmpeg unpacks SAND correctly).
+True zero-copy for SAND means a DRM overlay plane — the HVS scans it out
+natively — which is a bigger, KMSDRM-only build-out.
 
 The `decode: N ms/frame` log line is *not* the cost of decoding a frame. With
 frame threading, `avcodec_send_packet` returns before the work is done, so it

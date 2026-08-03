@@ -436,7 +436,17 @@ void MediaPresent(void) {
                     (readbackFrame->format == AV_PIX_FMT_NV12 ||
                      readbackFrame->format == AV_PIX_FMT_YUV420P)) {
                     UploadFrame(readbackFrame);
-                } /* anything else: keep the previous picture, drop this frame */
+                } else {
+                    /* Never silently: a stream of dropped frames looks like a
+                     * freeze and gets debugged in the wrong place. */
+                    static bool warned;
+                    if (!warned) {
+                        SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION,
+                                    "hw frame readback failed or gave format %d — video will stall"
+                                    " (try PLUME_NO_HWDEC=1)", readbackFrame ? readbackFrame->format : -1);
+                        warned = true;
+                    }
+                }
             }
         } else {
             UploadFrame(f);

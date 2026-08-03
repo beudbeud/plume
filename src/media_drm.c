@@ -9,6 +9,7 @@
  * a GLX or Vulkan-backed renderer the probe just fails and readback runs. */
 #include "media_drm.h"
 
+#include <inttypes.h>
 #include <string.h>
 #include <libavutil/hwcontext_drm.h>
 #include <libavutil/pixfmt.h>
@@ -57,7 +58,6 @@ static void (*pTexParameteri)(GLenum_, GLenum_, GLint_);
 static void (*pImageTargetTexture)(GLenum_, EGLImage_); /* glEGLImageTargetTexture2DOES */
 
 static int probed;         /* 0 = not yet, 1 = usable, -1 = not on this stack */
-static bool haveModifiers; /* EGL_EXT_image_dma_buf_import_modifiers */
 static bool isGles;        /* which SDL wrap property to use */
 static EGLDisplay_ dpy;
 static GLuint_ texY, texUV;
@@ -82,7 +82,6 @@ static bool Probe(SDL_Renderer *r) {
         SDL_Log("zero-copy: EGL_EXT_image_dma_buf_import missing, using readback");
         return false;
     }
-    haveModifiers = strstr(ext, "EGL_EXT_image_dma_buf_import_modifiers") != NULL;
     pCreateImage = (void *) SDL_EGL_GetProcAddress("eglCreateImageKHR");
     pDestroyImage = (void *) SDL_EGL_GetProcAddress("eglDestroyImageKHR");
     pImageTargetTexture = (void *) SDL_GL_GetProcAddress("glEGLImageTargetTexture2DOES");
@@ -99,9 +98,10 @@ static bool Probe(SDL_Renderer *r) {
     return true;
 }
 
-/* One plane -> one EGLImage bound to `tex`. */
+/* One plane -> one EGLImage bound to `tex`. Only linear (or implicit) layouts
+ * reach this point; see the modifier gate in DrmPrimeToTexture. */
 static bool ImportPlane(GLuint_ tex, uint32_t fourcc, int w, int h,
-                        int fd, int offset, int pitch, uint64_t modifier) {
+                        int fd, int offset, int pitch) {
     EGLint_ attribs[32];
     int n = 0;
     #define A(k, v) do { attribs[n++] = (EGLint_) (k); attribs[n++] = (EGLint_) (v); } while (0)
@@ -111,13 +111,6 @@ static bool ImportPlane(GLuint_ tex, uint32_t fourcc, int w, int h,
     A(EGL_DMA_BUF_PLANE0_FD_EXT, fd);
     A(EGL_DMA_BUF_PLANE0_OFFSET_EXT, offset);
     A(EGL_DMA_BUF_PLANE0_PITCH_EXT, pitch);
-    if (modifier != DRM_MOD_INVALID && modifier != DRM_MOD_LINEAR) {
-        /* A tiled buffer (e.g. the Pi's SAND layout) can only be described with
-         * the modifiers extension; without it the import would be a lie. */
-        if (!haveModifiers) return false;
-        A(EGL_DMA_BUF_PLANE0_MODIFIER_LO_EXT, (uint32_t) modifier);
-        A(EGL_DMA_BUF_PLANE0_MODIFIER_HI_EXT, (uint32_t) (modifier >> 32));
-    }
     #undef A
     attribs[n] = 0x3038; /* EGL_NONE */
     EGLImage_ img = pCreateImage(dpy, NULL, EGL_LINUX_DMA_BUF_EXT, NULL, attribs);
@@ -152,15 +145,25 @@ SDL_Texture *DrmPrimeToTexture(SDL_Renderer *r, const AVFrame *f) {
     }
     if (np != 2) return NULL;
 
+    /* Tiled layouts are a hard no, not a try-and-see: the Pi5's HEVC decoder
+     * emits Broadcom SAND buffers, Mesa v3d ACCEPTS the import — and then
+     * samples them as linear, which paints the whole screen pink. Per-plane
+     * R8/GR88 is only honest for linear (or implicit) layouts. Readback
+     * handles SAND correctly (the rpi FFmpeg unpacks it); a DRM overlay plane
+     * is the real zero-copy path for those, the HVS scans SAND natively. */
+    uint64_t mod = d->objects[pl[0].obj].format_modifier;
+    if (mod != DRM_MOD_INVALID && mod != DRM_MOD_LINEAR) {
+        SDL_Log("zero-copy: tiled buffer (modifier 0x%" PRIx64 "), using readback", mod);
+        probed = -1;
+        return NULL;
+    }
+
     if (!ImportPlane(texY, FOURCC_R8, f->width, f->height,
-                     d->objects[pl[0].obj].fd, pl[0].offset, pl[0].pitch,
-                     d->objects[pl[0].obj].format_modifier) ||
+                     d->objects[pl[0].obj].fd, pl[0].offset, pl[0].pitch) ||
         !ImportPlane(texUV, FOURCC_GR88, f->width / 2, f->height / 2,
-                     d->objects[pl[1].obj].fd, pl[1].offset, pl[1].pitch,
-                     d->objects[pl[1].obj].format_modifier)) {
-        /* Typically a modifier the GPU can't sample (tiled SAND on the Pi).
-         * Fail permanently: retrying per frame would just burn CPU. */
-        SDL_Log("zero-copy: dmabuf import rejected (modifier?), using readback");
+                     d->objects[pl[1].obj].fd, pl[1].offset, pl[1].pitch)) {
+        /* Fail permanently: retrying per frame would just burn CPU. */
+        SDL_Log("zero-copy: dmabuf import rejected, using readback");
         probed = -1;
         return NULL;
     }
