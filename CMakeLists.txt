@@ -28,8 +28,16 @@ endif()
 find_package(PkgConfig REQUIRED)
 pkg_check_modules(SDL3 REQUIRED sdl3 sdl3-ttf)
 pkg_check_modules(FFMPEG REQUIRED libavcodec libavutil libswscale libswresample)
+# Optional: the DRM video plane path (true zero-copy for the Pi's SAND frames).
+# Without libdrm the plane probe compiles to a stub and the GPU paths remain.
+pkg_check_modules(LIBDRM libdrm)
 
-add_executable(plume src/main.c src/media.c src/media_drm.c src/ui.c src/ihs.c)
+add_executable(plume src/main.c src/media.c src/media_drm.c src/media_drm_plane.c src/ui.c src/ihs.c)
+if(LIBDRM_FOUND)
+    target_compile_definitions(plume PRIVATE PLUME_HAVE_LIBDRM)
+    target_include_directories(plume PRIVATE ${LIBDRM_INCLUDE_DIRS})
+    target_link_libraries(plume PRIVATE ${LIBDRM_LIBRARIES})
+endif()
 # Keep frame pointers and export symbols so the SIGSEGV handler's backtrace names
 # functions instead of bare addresses. Costs nothing measurable here.
 target_compile_options(plume PRIVATE -g -fno-omit-frame-pointer)

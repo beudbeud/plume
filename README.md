@@ -131,22 +131,26 @@ that board.
 
 ### Zero-copy presentation
 
-When the decoder hands back `DRM_PRIME` frames (Pi5 HEVC), plume tries to show
-them without copying: the dmabuf planes are imported as EGLImages bound to GL
-textures and wrapped in an SDL texture — no GPU→RAM readback, no re-upload.
-Every precondition is probed at runtime (EGL-backed GL renderer, the
-`dma_buf_import` extension, a modifier the GPU can sample); if any is missing
-plume logs why once and reads the frame back on the main thread instead — which
-still keeps the decode thread lighter than before. Run with `--verbose` and look
-for the `zero-copy:` log lines to see which path you got. `PLUME_NO_ZEROCOPY=1`
-restores the old decode-thread readback entirely.
+When the decoder hands back `DRM_PRIME` frames (Pi HEVC), plume tries three
+paths in order, each probed at runtime and each falling back to the next with
+one log line saying why:
 
-Known ceiling: the Pi5's HEVC decoder emits Broadcom SAND-tiled buffers, and
-Mesa v3d *accepts* their EGL import but samples them as linear — the whole
-screen comes out pink. Tiled modifiers are therefore rejected up front and
-those frames take the readback path (the rpi FFmpeg unpacks SAND correctly).
-True zero-copy for SAND means a DRM overlay plane — the HVS scans it out
-natively — which is a bigger, KMSDRM-only build-out.
+1. **DRM video plane** (KMSDRM only, needs libdrm at build time): the frame's
+   dmabuf becomes a DRM framebuffer scanned out directly by the display
+   controller on an overlay plane above SDL's output. No GPU sampling, no
+   readback, no upload — true zero-copy, and it handles the Pi's SAND tiling,
+   which the HVS understands natively. The plane covers SDL's rendering, so
+   toggling the stats overlay switches to the GPU path while it is visible.
+2. **EGLImage import**: dmabuf planes wrapped as GL textures inside an SDL
+   NV12 texture. Linear buffers only — Mesa v3d *accepts* a SAND import and
+   then samples it as linear (the whole screen comes out pink), so tiled
+   modifiers are rejected up front.
+3. **Readback** on the main thread (the rpi FFmpeg unpacks SAND correctly);
+   still lighter for the decode thread than the pre-zero-copy pipeline.
+
+Run with `--verbose` and look for the `drm-plane:` and `zero-copy:` log lines
+to see which path you got. `PLUME_NO_ZEROCOPY=1` restores the old
+decode-thread readback entirely.
 
 The `decode: N ms/frame` log line is *not* the cost of decoding a frame. With
 frame threading, `avcodec_send_packet` returns before the work is done, so it
@@ -219,8 +223,6 @@ relinking requirement.
 ## Not included (add when needed)
 
 - Relative-mouse capture for FPS games (only absolute mouse is forwarded).
-- A DRM overlay plane for SAND-tiled Pi frames, if EGL import turns out not to
-  cover them (see Zero-copy presentation above).
 - An in-stream settings/help overlay, and the launcher's **?** icon.
 - `IHSLIB_SAMPLES=OFF`: the upstream samples still use the old `submit` callback
   signature and would not compile.

@@ -16,7 +16,7 @@ jobs:
           apt-get update
           apt-get install -y --no-install-recommends git ca-certificates \
             cmake pkg-config build-essential \
-            libsdl3-dev libsdl3-ttf-dev \
+            libsdl3-dev libsdl3-ttf-dev libdrm-dev \
             libavcodec-dev libavutil-dev libswscale-dev libswresample-dev \
             libprotobuf-c-dev libmbedtls-dev
       - uses: actions/checkout@v5

@@ -29,6 +29,7 @@ static SDL_Texture *shownTex;            /* whatever the last frame landed in (u
 static int shownW, shownH;
 static bool zeroCopyWanted;              /* !PLUME_NO_ZEROCOPY, latched at VideoStart */
 static AVFrame *readbackFrame;           /* main-thread readback when import isn't possible */
+static bool planeActive;                 /* video is on a DRM plane; skip the SDL texture draw */
 
 /* ---- Video decode (network thread writes, main thread reads) ---- */
 static AVCodecContext *vctx;
@@ -70,6 +71,12 @@ void MediaToggleStats(void) {
     statsOn = !statsOn;
     statsLine[0] = '\0';
     statsT0 = 0; /* restart the 1 s window on the next present */
+    if (statsOn && planeActive) {
+        /* The DRM plane sits above SDL's output: the overlay would be
+         * invisible behind the video. Drop to the GPU path while it's shown. */
+        DrmPlaneHide();
+        planeActive = false;
+    }
 }
 
 /* Main thread only: last time MediaPresent showed a NEW frame (0 = none yet).
@@ -115,6 +122,8 @@ void MediaDetach(void) {
     if (texture) { SDL_DestroyTexture(texture); texture = NULL; texW = texH = 0; }
     shownTex = NULL;
     shownW = shownH = 0;
+    DrmPlaneReset();
+    planeActive = false;
     DrmPrimeReset();
     av_frame_free(&readbackFrame);
     if (frameLock) { SDL_DestroyMutex(frameLock); frameLock = NULL; }
@@ -420,31 +429,43 @@ void MediaPresent(void) {
     SDL_RenderClear(renderer);
     if (f) {
         if (f->format == AV_PIX_FMT_DRM_PRIME) {
-            SDL_Texture *zc = DrmPrimeToTexture(renderer, f);
-            if (zc) {
-                /* The dmabuf stays referenced through `consumed` until the next
-                 * TakeFrame, so the GPU reads a live buffer. */
-                shownTex = zc;
+            /* Preference order: DRM plane (true zero-copy, handles SAND),
+             * then EGL import (linear buffers), then readback. The stats
+             * overlay needs SDL's output visible, so it forces the GPU path. */
+            int ow, oh;
+            SDL_GetRenderOutputSize(renderer, &ow, &oh);
+            if (!statsOn && DrmPlanePresent(window, f, ow, oh, scaleMode)) {
+                planeActive = true;
                 shownW = f->width;
                 shownH = f->height;
             } else {
-                /* Import impossible on this stack: read back here, on the main
-                 * thread — the decode thread stays light either way. */
-                if (!readbackFrame) readbackFrame = av_frame_alloc();
-                av_frame_unref(readbackFrame);
-                if (readbackFrame && av_hwframe_transfer_data(readbackFrame, f, 0) == 0 &&
-                    (readbackFrame->format == AV_PIX_FMT_NV12 ||
-                     readbackFrame->format == AV_PIX_FMT_YUV420P)) {
-                    UploadFrame(readbackFrame);
+                if (planeActive) { DrmPlaneHide(); planeActive = false; }
+                SDL_Texture *zc = DrmPrimeToTexture(renderer, f);
+                if (zc) {
+                    /* The dmabuf stays referenced through `consumed` until the
+                     * next TakeFrame, so the GPU reads a live buffer. */
+                    shownTex = zc;
+                    shownW = f->width;
+                    shownH = f->height;
                 } else {
-                    /* Never silently: a stream of dropped frames looks like a
-                     * freeze and gets debugged in the wrong place. */
-                    static bool warned;
-                    if (!warned) {
-                        SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION,
-                                    "hw frame readback failed or gave format %d — video will stall"
-                                    " (try PLUME_NO_HWDEC=1)", readbackFrame ? readbackFrame->format : -1);
-                        warned = true;
+                    /* Read back here, on the main thread — the decode thread
+                     * stays light either way. */
+                    if (!readbackFrame) readbackFrame = av_frame_alloc();
+                    av_frame_unref(readbackFrame);
+                    if (readbackFrame && av_hwframe_transfer_data(readbackFrame, f, 0) == 0 &&
+                        (readbackFrame->format == AV_PIX_FMT_NV12 ||
+                         readbackFrame->format == AV_PIX_FMT_YUV420P)) {
+                        UploadFrame(readbackFrame);
+                    } else {
+                        /* Never silently: a stream of dropped frames looks like
+                         * a freeze and gets debugged in the wrong place. */
+                        static bool warned;
+                        if (!warned) {
+                            SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION,
+                                        "hw frame readback failed or gave format %d — video will stall"
+                                        " (try PLUME_NO_HWDEC=1)", readbackFrame ? readbackFrame->format : -1);
+                            warned = true;
+                        }
                     }
                 }
             }
@@ -456,7 +477,7 @@ void MediaPresent(void) {
         lastFrameNs = SDL_GetTicksNS();
     }
 
-    if (shownTex) {
+    if (shownTex && !planeActive) {
         if (scaleMode == MEDIA_SCALE_STRETCH) {
             SDL_RenderTexture(renderer, shownTex, NULL, NULL);
         } else {
