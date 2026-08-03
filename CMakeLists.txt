@@ -29,7 +29,7 @@ find_package(PkgConfig REQUIRED)
 pkg_check_modules(SDL3 REQUIRED sdl3 sdl3-ttf)
 pkg_check_modules(FFMPEG REQUIRED libavcodec libavutil libswscale libswresample)
 
-add_executable(plume src/main.c src/media.c src/ui.c src/ihs.c)
+add_executable(plume src/main.c src/media.c src/media_drm.c src/ui.c src/ihs.c)
 # Keep frame pointers and export symbols so the SIGSEGV handler's backtrace names
 # functions instead of bare addresses. Costs nothing measurable here.
 target_compile_options(plume PRIVATE -g -fno-omit-frame-pointer)

@@ -17,13 +17,18 @@
 #include <libavutil/pixdesc.h>
 
 #include "ui.h" /* UIDrawOverlay: the stats HUD borrows the launcher's fonts */
+#include "media_drm.h"
 
 /* ---- SDL window / renderer (borrowed from main.c) ---- */
 static SDL_Window *window;
 static SDL_Renderer *renderer;
-static SDL_Texture *texture;
+static SDL_Texture *texture;             /* upload path: owned streaming texture */
 static int texW, texH;
 static SDL_PixelFormat texFmt;
+static SDL_Texture *shownTex;            /* whatever the last frame landed in (upload or zero-copy) */
+static int shownW, shownH;
+static bool zeroCopyWanted;              /* !PLUME_NO_ZEROCOPY, latched at VideoStart */
+static AVFrame *readbackFrame;           /* main-thread readback when import isn't possible */
 
 /* ---- Video decode (network thread writes, main thread reads) ---- */
 static AVCodecContext *vctx;
@@ -108,6 +113,10 @@ void MediaDetach(void) {
     statsSession = NULL; /* the session is being torn down; never report into it */
     frameDirty = false;
     if (texture) { SDL_DestroyTexture(texture); texture = NULL; texW = texH = 0; }
+    shownTex = NULL;
+    shownW = shownH = 0;
+    DrmPrimeReset();
+    av_frame_free(&readbackFrame);
     if (frameLock) { SDL_DestroyMutex(frameLock); frameLock = NULL; }
     av_frame_free(&latched);
     av_frame_free(&consumed);
@@ -150,6 +159,9 @@ static int VideoStart(IHS_Session *session, const IHS_StreamVideoConfig *config,
     }
     vNeedFlush = false;
     vHaveLast = false;
+    /* The escape hatch restores the old behaviour entirely: readback on the
+     * decode thread, nothing DRM ever reaches the latch. */
+    zeroCopyWanted = SDL_getenv("PLUME_NO_ZEROCOPY") == NULL;
 
     /* Two shapes of hardware decode, and the Pi generations disagree on which:
      *
@@ -198,6 +210,9 @@ static int VideoStart(IHS_Session *session, const IHS_StreamVideoConfig *config,
         if (useHw) {
             /* Hardware decode is single-frame-latency anyway; ask for it explicitly. */
             vctx->flags |= AV_CODEC_FLAG_LOW_DELAY;
+            /* Zero-copy holds two decoded buffers (latched + consumed) outside
+             * the decoder; give its pool that much slack or it can stall. */
+            vctx->extra_hw_frames = 3;
         } else {
             /* AV_CODEC_FLAG_LOW_DELAY disables frame threading (libavcodec
              * validate_thread_parameters), and NVENC emits one slice per frame so
@@ -268,6 +283,13 @@ static AVFrame *TakeFrame(uint16_t *frameId) {
 /* Drain every frame the decoder has ready into the latch. */
 static void ReceiveFrames(uint16_t frameId) {
     while (avcodec_receive_frame(vctx, vframe) == 0) {
+        /* DRM_PRIME frames go to the consumer as-is: MediaPresent either
+         * imports the dmabuf (zero-copy) or reads it back there. Both keep
+         * the session worker thread — which also feeds audio — light. */
+        if (vframe->format == AV_PIX_FMT_DRM_PRIME && zeroCopyWanted) {
+            StashFrame(vframe, frameId);
+            continue;
+        }
         /* If a HW decoder handed back GPU frames, pull them into system
          * memory (offloads decode; pays one readback — still far cheaper
          * than software HEVC). Most Pi v4l2m2m builds return NV12 directly,
@@ -365,49 +387,80 @@ static void VideoStop(IHS_Session *session, void *context) {
     av_frame_free(&vframe);
 }
 
+/* Upload one CPU-side frame into the streaming texture. */
+static void UploadFrame(const AVFrame *f) {
+    SDL_PixelFormat fmt = f->format == AV_PIX_FMT_NV12 ? SDL_PIXELFORMAT_NV12
+                                                       : SDL_PIXELFORMAT_IYUV;
+    if (!texture || texW != f->width || texH != f->height || texFmt != fmt) {
+        if (texture) SDL_DestroyTexture(texture);
+        texture = SDL_CreateTexture(renderer, fmt, SDL_TEXTUREACCESS_STREAMING,
+                                    f->width, f->height);
+        texW = f->width; texH = f->height; texFmt = fmt;
+    }
+    if (fmt == SDL_PIXELFORMAT_NV12) {
+        SDL_UpdateNVTexture(texture, NULL,
+                            f->data[0], f->linesize[0],
+                            f->data[1], f->linesize[1]);
+    } else {
+        SDL_UpdateYUVTexture(texture, NULL,
+                             f->data[0], f->linesize[0],
+                             f->data[1], f->linesize[1],
+                             f->data[2], f->linesize[2]);
+    }
+    shownTex = texture;
+    shownW = texW;
+    shownH = texH;
+}
+
 void MediaPresent(void) {
     uint16_t shownId = 0;
     AVFrame *f = TakeFrame(&shownId);
+    /* Clear first: it also guarantees the renderer's GL context is current
+     * before any dmabuf import touches EGL. */
+    SDL_RenderClear(renderer);
     if (f) {
-        SDL_PixelFormat fmt = f->format == AV_PIX_FMT_NV12 ? SDL_PIXELFORMAT_NV12
-                                                           : SDL_PIXELFORMAT_IYUV;
-        if (!texture || texW != f->width || texH != f->height || texFmt != fmt) {
-            if (texture) SDL_DestroyTexture(texture);
-            texture = SDL_CreateTexture(renderer, fmt, SDL_TEXTUREACCESS_STREAMING,
-                                        f->width, f->height);
-            texW = f->width; texH = f->height; texFmt = fmt;
-        }
-        if (fmt == SDL_PIXELFORMAT_NV12) {
-            SDL_UpdateNVTexture(texture, NULL,
-                                f->data[0], f->linesize[0],
-                                f->data[1], f->linesize[1]);
+        if (f->format == AV_PIX_FMT_DRM_PRIME) {
+            SDL_Texture *zc = DrmPrimeToTexture(renderer, f);
+            if (zc) {
+                /* The dmabuf stays referenced through `consumed` until the next
+                 * TakeFrame, so the GPU reads a live buffer. */
+                shownTex = zc;
+                shownW = f->width;
+                shownH = f->height;
+            } else {
+                /* Import impossible on this stack: read back here, on the main
+                 * thread — the decode thread stays light either way. */
+                if (!readbackFrame) readbackFrame = av_frame_alloc();
+                av_frame_unref(readbackFrame);
+                if (readbackFrame && av_hwframe_transfer_data(readbackFrame, f, 0) == 0 &&
+                    (readbackFrame->format == AV_PIX_FMT_NV12 ||
+                     readbackFrame->format == AV_PIX_FMT_YUV420P)) {
+                    UploadFrame(readbackFrame);
+                } /* anything else: keep the previous picture, drop this frame */
+            }
         } else {
-            SDL_UpdateYUVTexture(texture, NULL,
-                                 f->data[0], f->linesize[0],
-                                 f->data[1], f->linesize[1],
-                                 f->data[2], f->linesize[2]);
+            UploadFrame(f);
         }
         IHS_SessionReportVideoFrameStage(statsSession, shownId, IHS_VideoFrameStageUploadEnd, 0);
         statsShown++;
         lastFrameNs = SDL_GetTicksNS();
     }
 
-    SDL_RenderClear(renderer);
-    if (texture) {
+    if (shownTex) {
         if (scaleMode == MEDIA_SCALE_STRETCH) {
-            SDL_RenderTexture(renderer, texture, NULL, NULL);
+            SDL_RenderTexture(renderer, shownTex, NULL, NULL);
         } else {
             /* The host always streams its own aspect ratio, so a 16:9 desktop on a
              * 4:3 display needs bars (fit) or lost edges (crop). min() leaves bars,
              * max() overflows the screen and SDL clips the excess. */
             int ow, oh;
             SDL_GetRenderOutputSize(renderer, &ow, &oh);
-            float sx = (float) ow / texW, sy = (float) oh / texH;
+            float sx = (float) ow / shownW, sy = (float) oh / shownH;
             float scale = scaleMode == MEDIA_SCALE_CROP ? SDL_max(sx, sy) : SDL_min(sx, sy);
-            SDL_FRect dst = {.w = texW * scale, .h = texH * scale};
+            SDL_FRect dst = {.w = shownW * scale, .h = shownH * scale};
             dst.x = (ow - dst.w) / 2;
             dst.y = (oh - dst.h) / 2;
-            SDL_RenderTexture(renderer, texture, NULL, &dst);
+            SDL_RenderTexture(renderer, shownTex, NULL, &dst);
         }
     }
     if (statsOn) {
@@ -420,7 +473,7 @@ void MediaPresent(void) {
             int us = SDL_SetAtomicInt(&statsDecodeUs, 0);
             SDL_snprintf(statsLine, sizeof(statsLine),
                          "%dx%d %s | %.0f fps | %.1f Mbps | dec %.1f ms | drop %d",
-                         texW, texH, statsCodec, statsShown / dt, bytes * 8.0f / dt / 1e6f,
+                         shownW, shownH, statsCodec, statsShown / dt, bytes * 8.0f / dt / 1e6f,
                          dec > 0 ? us / 1000.0f / dec : 0.0f, SDL_GetAtomicInt(&statsDropped));
             statsShown = 0;
             statsT0 = now;

@@ -127,6 +127,23 @@ The Pi3 and Pi4 need their hardware decoder. Software H264 on a Cortex-A53 will
 not hold 1080p60, and the Pi3's VideoCore caps H264 at 1080p30 — expect 720p on
 that board.
 
+### Zero-copy presentation
+
+When the decoder hands back `DRM_PRIME` frames (Pi5 HEVC), plume tries to show
+them without copying: the dmabuf planes are imported as EGLImages bound to GL
+textures and wrapped in an SDL texture — no GPU→RAM readback, no re-upload.
+Every precondition is probed at runtime (EGL-backed GL renderer, the
+`dma_buf_import` extension, a modifier the GPU can sample); if any is missing
+plume logs why once and reads the frame back on the main thread instead — which
+still keeps the decode thread lighter than before. Run with `--verbose` and look
+for the `zero-copy:` log lines to see which path you got. `PLUME_NO_ZEROCOPY=1`
+restores the old decode-thread readback entirely.
+
+Known ceiling: the Pi's SAND-tiled buffers import only if Mesa v3d accepts the
+`BROADCOM_SAND128` modifier for sampling; if it refuses, the fallback runs and
+the next step is a DRM overlay plane (the HVS scans out SAND natively), which is
+a bigger, KMSDRM-only build-out.
+
 The `decode: N ms/frame` log line is *not* the cost of decoding a frame. With
 frame threading, `avcodec_send_packet` returns before the work is done, so it
 measures the serialized part only; the real work is spread across cores.
@@ -198,9 +215,8 @@ relinking requirement.
 ## Not included (add when needed)
 
 - Relative-mouse capture for FPS games (only absolute mouse is forwarded).
-- Zero-copy for HW decode: HEVC frames are read back and uploaded to an SDL
-  texture. DRM-prime/EGL DMABUF import would avoid the copy — add if the readback
-  becomes a bottleneck.
+- A DRM overlay plane for SAND-tiled Pi frames, if EGL import turns out not to
+  cover them (see Zero-copy presentation above).
 - An in-stream settings/help overlay, and the launcher's **?** icon.
 - `IHSLIB_SAMPLES=OFF`: the upstream samples still use the old `submit` callback
   signature and would not compile.
