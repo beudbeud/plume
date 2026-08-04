@@ -87,7 +87,8 @@ static bool Probe(SDL_Window *win) {
         SDL_Log("drm-plane: SDL exposed no DRM fd, no plane path");
         return false;
     }
-    drmSetClientCap(fd, DRM_CLIENT_CAP_UNIVERSAL_PLANES, 1);
+    if (drmSetClientCap(fd, DRM_CLIENT_CAP_UNIVERSAL_PLANES, 1) != 0)
+        SDL_Log("drm-plane: universal planes cap refused (legacy plane list)");
 
     /* The active CRTC is the one SDL is flipping. */
     int crtcIndex = -1;
@@ -106,7 +107,9 @@ static bool Probe(SDL_Window *win) {
         return false;
     }
 
-    /* First free overlay plane on that CRTC that speaks NV12. */
+    /* First free overlay plane on that CRTC that speaks NV12. A plane with no
+     * "type" property comes from the legacy list, which only ever contains
+     * overlays — treat it as one instead of rejecting it. */
     drmModePlaneRes *pr = drmModeGetPlaneResources(fd);
     if (!pr) return false;
     for (uint32_t i = 0; i < pr->count_planes && !planeId; i++) {
@@ -118,15 +121,22 @@ static bool Probe(SDL_Window *win) {
         for (uint32_t j = 0; j < p->count_formats; j++) {
             if (p->formats[j] == DRM_FORMAT_NV12) nv12 = true;
         }
-        if (onCrtc && !inUse && nv12 &&
-            PlanePropValue(pr->planes[i], "type", DRM_PLANE_TYPE_PRIMARY) == DRM_PLANE_TYPE_OVERLAY) {
+        uint64_t type = PlanePropValue(pr->planes[i], "type", UINT64_MAX);
+        bool overlay = type == DRM_PLANE_TYPE_OVERLAY || type == UINT64_MAX;
+        if (onCrtc && !inUse && nv12 && overlay) {
             planeId = pr->planes[i];
+        } else {
+            /* One line per rejected plane: this is the whole diagnosis when a
+             * board refuses the fast path, and it only shows under --verbose. */
+            SDL_Log("drm-plane: plane %u skipped (type=%d crtcs=0x%x fb=%u nv12=%d)",
+                    pr->planes[i], type == UINT64_MAX ? -1 : (int) type,
+                    p->possible_crtcs, p->fb_id, nv12);
         }
         drmModeFreePlane(p);
     }
     drmModeFreePlaneResources(pr);
     if (!planeId) {
-        SDL_Log("drm-plane: no free NV12 overlay plane, no plane path");
+        SDL_Log("drm-plane: no usable plane on CRTC %u (index %d), no plane path", crtcId, crtcIndex);
         return false;
     }
 
