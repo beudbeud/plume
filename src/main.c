@@ -3,7 +3,7 @@
  *   plume                 open the launcher: pick a host, stream it
  *   plume --host <ip>     stream that host directly, exit when the stream ends
  *   plume --pair [--host <ip>]   pair headlessly; stdout: "PIN <4 digits>"
- *   plume --discover      list hosts, one "<ip>\t?\t<hostname>" line each
+ *   plume --discover      list hosts, one "<ip>\t<1|?>\t<hostname>" line each
  *   plume --timeout <s>   discovery timeout (3 for --discover, else 10)
  *   plume --width/--height/--fps/--kbps <n>   override settings.conf for this run
  *   plume --no-audio      video only
@@ -409,9 +409,12 @@ int main(int argc, char *argv[]) {
         for (int i = 0; i < n; i++) {
             char *ip = IHS_IPAddressToString(&found[i].address.ip);
             PlumeCleanName(found[i].hostname);
-            /* "?": the status broadcast doesn't say whether this device is
-             * approved; only a stream request does, and that wakes the host. */
-            if (ip) printf("%s\t?\t%s\n", ip, found[i].hostname);
+            /* The status broadcast doesn't say whether this device is approved;
+             * only a stream request does, and that wakes the host. What we do
+             * know is whether we hold a key for it: "1", else "?" (it may still
+             * be paired the pre-key-exchange way). */
+            uint8_t key[32];
+            if (ip) printf("%s\t%s\t%s\n", ip, PlumeLoadHostKey(&found[i], key) ? "1" : "?", found[i].hostname);
             free(ip);
         }
         IHS_Quit();

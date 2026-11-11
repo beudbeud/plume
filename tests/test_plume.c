@@ -86,5 +86,14 @@ int main(void) {
     assert(FileHolds(path, "identity"));
 
     printf("ok\n");
+    /* a host's pairing key comes back as written, and only for that host */
+    IHS_HostInfo hostA = {.clientId = 0x1122334455667788ull}, hostB = {.clientId = 42};
+    uint8_t key[32], back[32];
+    memset(key, 0xA5, sizeof(key));
+    assert(!PlumeLoadHostKey(&hostA, back));
+    assert(PlumeSaveHostKey(&hostA, key));
+    assert(PlumeLoadHostKey(&hostA, back) && memcmp(key, back, 32) == 0);
+    assert(!PlumeLoadHostKey(&hostB, back));
+
     return 0;
 }

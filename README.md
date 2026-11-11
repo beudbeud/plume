@@ -101,14 +101,17 @@ else goes to stderr. Exit codes: 0 ok, 1 failure, 2 usage, 3 host not found,
 
 | Command | Does |
 |---|---|
-| `plume --discover [--timeout <s>]` | Lists every host answering within 3 s, one `<ip>\t?\t<hostname>` line each. The middle column is the paired state, always `?`: discovery doesn't reveal it. |
+| `plume --discover [--timeout <s>]` | Lists every host answering within 3 s, one `<ip>\t<1|?>\t<hostname>` line each. The middle column is `1` when plume holds a pairing key for that host, `?` otherwise: discovery itself doesn't reveal the paired state. |
 | `plume --pair [--host <ip>]` | Prints `PIN <4 digits>`, then waits for the host. SIGTERM aborts cleanly. |
 | `plume --host <ip>` | Streams that host and exits when the stream ends (4 if it isn't paired yet). |
 
 By default only problems are printed. `--verbose` adds the IHSlib protocol trace
 and the decoder's chatter.
 
-Device identity lives next door in `creds.bin`, so pairing survives restarts. A
+Device identity lives next door in `creds.bin`, so pairing survives restarts.
+Current Steam pairs with a key exchange, so each paired host also gets a
+`host-<id>.key` there holding the secret negotiated with it; delete it to forget
+that host. A
 pre-rename `~/.local/share/steamlink-ihs/` is adopted on first run, so no one has
 to re-enter a PIN.
 

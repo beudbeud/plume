@@ -53,6 +53,12 @@ void PlumeCleanName(char *s);
 bool PlumeRequestStream(const IHS_HostInfo *host, int maxWidth, int maxHeight, bool desktop,
                         int gamepadCount, IHS_SessionInfo *out, IHS_StreamingResult *result);
 
+/* The secret negotiated with one host at pairing, kept next to creds.bin.
+ * Load returns false for a host never paired (or paired before Steam's key
+ * exchange, when creds.bin's own key was the secret). */
+bool PlumeSaveHostKey(const IHS_HostInfo *host, const uint8_t key[32]);
+bool PlumeLoadHostKey(const IHS_HostInfo *host, uint8_t key[32]);
+
 /* ------------------------------- pairing ---------------------------------- */
 /* Split in two because the caller has to show the PIN while the host waits for
  * it: a blocking pair() would never get a chance to draw it. Start, then poll

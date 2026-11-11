@@ -79,6 +79,36 @@ void PlumeInitCreds(void) {
     PlumeClientConfig = (IHS_ClientConfig) {g_deviceId, g_secretKey, g_deviceName};
 }
 
+/* Current Steam pairs with a key exchange, so the secret is per host: creds.bin
+ * stays the device identity (and the key for hosts paired the old way), and each
+ * host paired since gets its own file.
+ * ponytail: keyed on the host's Steam client id, which survives an IP change;
+ * if it turns out not to survive a Steam reinstall, the cost is one re-pair. */
+static void HostKeyPath(const IHS_HostInfo *host, char *out, size_t n) {
+    char name[40];
+    snprintf(name, sizeof(name), "host-%016llx.key", (unsigned long long) host->clientId);
+    PlumeDataPath(out, n, name);
+}
+
+bool PlumeSaveHostKey(const IHS_HostInfo *host, const uint8_t key[32]) {
+    char path[512];
+    HostKeyPath(host, path, sizeof(path));
+    int fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0600);
+    bool ok = fd >= 0 && write(fd, key, 32) == 32;
+    if (fd >= 0) close(fd);
+    if (!ok) fprintf(stderr, "cannot write %s: this pairing is lost\n", path);
+    return ok;
+}
+
+bool PlumeLoadHostKey(const IHS_HostInfo *host, uint8_t key[32]) {
+    char path[512];
+    HostKeyPath(host, path, sizeof(path));
+    int fd = open(path, O_RDONLY);
+    bool ok = fd >= 0 && read(fd, key, 32) == 32;
+    if (fd >= 0) close(fd);
+    return ok;
+}
+
 /* Name an address as module+offset, which addr2line can turn back into a line. */
 static void PrintAddr(const char *label, void *addr) {
     Dl_info info;
@@ -242,11 +272,14 @@ void PlumeCleanName(char *s) {
 
 /* ------------------------------- pairing ---------------------------------- */
 static void OnAuthSuccess(IHS_Client *c, const IHS_HostInfo *h, uint64_t steamId, void *ctx) {
-    (void) h;
     /* stderr: stdout belongs to whoever is parsing --pair / --discover. */
     fprintf(stderr, "Paired (steamId=%llu)\n", (unsigned long long) steamId);
     PlumePairing *p = ctx;
-    SDL_SetAtomicInt(&p->ok, 1);
+    /* The client now holds the key negotiated with this host; without it on
+     * disk the next stream request is Unauthorized, so no key = not paired. */
+    uint8_t key[32];
+    IHS_ClientGetSecretKey(c, key);
+    SDL_SetAtomicInt(&p->ok, PlumeSaveHostKey(h, key));
     SDL_SetAtomicInt(&p->done, 1);
     IHS_ClientStop(c);
 }
@@ -291,6 +324,10 @@ bool PlumePairStart(PlumePairing *p, const IHS_HostInfo *host, const char *pin) 
 
 bool PlumePairFinish(PlumePairing *p) {
     if (!p->client) return false;
+    /* Abandoned before the host answered: tell it, or Steam's PIN dialog stays
+     * up. The next request from this device is then matched against that old
+     * dialog's PIN and fails (result=7) however carefully the new one is typed. */
+    if (!SDL_GetAtomicInt(&p->done)) IHS_ClientAuthorizationCancel(p->client);
     IHS_ClientStop(p->client); /* no-op if a callback already stopped it */
     IHS_ClientThreadedJoin(p->client);
     IHS_ClientStopDiscovery(p->client);
@@ -340,6 +377,8 @@ bool PlumeRequestStream(const IHS_HostInfo *host, int maxWidth, int maxHeight, b
         return false;
     }
     IHS_ClientSetLogFunction(client, PlumeLog);
+    uint8_t hostKey[32];
+    if (PlumeLoadHostKey(host, hostKey)) IHS_ClientSetSecretKey(client, hostKey);
     StreamReq req = {0};
     /* Static like the others (IHSlib keeps the pointer). This frame does
      * outlive the client today, but that is one refactor away from a crash. */
