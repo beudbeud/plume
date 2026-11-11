@@ -105,6 +105,10 @@ else goes to stderr. Exit codes: 0 ok, 1 failure, 2 usage, 3 host not found,
 | `plume --pair [--host <ip>]` | Prints `PIN <4 digits>`, then waits for the host. SIGTERM aborts cleanly. |
 | `plume --host <ip>` | Streams that host and exits when the stream ends (4 if it isn't paired yet). |
 
+SIGTERM ends plume in any state, within 5 s at worst. While it waits for the
+host (first request or a reconnect) Hotkey + Start, B and Esc quit too, and a
+request the host never settles is dropped after 20 s.
+
 By default only problems are printed. `--verbose` adds the IHSlib protocol trace
 and the decoder's chatter.
 

@@ -337,7 +337,9 @@ bool PlumePairFinish(PlumePairing *p) {
 }
 
 /* -------------------- streaming request -> session info ------------------- */
-typedef struct { bool done; bool ok; IHS_SessionInfo info; IHS_StreamingResult result; } StreamReq;
+typedef struct { SDL_AtomicInt done; bool ok; IHS_SessionInfo info; IHS_StreamingResult result; } StreamReq;
+
+bool (*PlumeRequestAbort)(void);
 
 static void OnStreamSuccess(IHS_Client *c, const IHS_HostInfo *h, const IHS_SocketAddress *addr,
                             const uint8_t *key, size_t keyLen, void *ctx) {
@@ -349,8 +351,8 @@ static void OnStreamSuccess(IHS_Client *c, const IHS_HostInfo *h, const IHS_Sock
     if (keyLen > sizeof(s->info.sessionKey)) {
         fprintf(stderr, "Host sent a %zu-byte session key (max %zu), refusing\n",
                 keyLen, sizeof(s->info.sessionKey));
-        s->done = true;
         s->result = IHS_StreamingFailed;
+        SDL_SetAtomicInt(&s->done, 1);
         IHS_ClientStop(c);
         return;
     }
@@ -358,13 +360,15 @@ static void OnStreamSuccess(IHS_Client *c, const IHS_HostInfo *h, const IHS_Sock
     s->info.sessionKeyLen = keyLen;
     memcpy(s->info.sessionKey, key, keyLen);
     s->info.steamId = 0;
-    s->done = true; s->ok = true;
+    s->ok = true;
+    SDL_SetAtomicInt(&s->done, 1);
     IHS_ClientStop(c);
 }
 static void OnStreamFailed(IHS_Client *c, const IHS_HostInfo *h, IHS_StreamingResult r, void *ctx) {
     (void) h;
     fprintf(stderr, "Streaming request failed (result=%d)\n", r);
-    StreamReq *s = ctx; s->done = true; s->result = r;
+    StreamReq *s = ctx; s->result = r;
+    SDL_SetAtomicInt(&s->done, 1);
     IHS_ClientStop(c);
 }
 static void OnStreamProgress(IHS_Client *c, const IHS_HostInfo *h, void *ctx) { (void)c;(void)h;(void)ctx; }
@@ -398,6 +402,18 @@ bool PlumeRequestStream(const IHS_HostInfo *host, int maxWidth, int maxHeight, b
      * it ThreadedJoin returns instantly and the request is never delivered. */
     IHS_ClientStartDiscovery(client, 0);
     IHS_ClientStreamingRequest(client, host, &r);
+    /* A host that keeps answering "in progress" resets IHSlib's own 15 s
+     * timeout forever, so bound the wait here and let the caller's quit
+     * (pad, key, SIGTERM) cut it short. */
+    Uint64 deadline = SDL_GetTicks() + PLUME_REQUEST_TIMEOUT_MS;
+    while (!SDL_GetAtomicInt(&req.done) && SDL_GetTicks() < deadline &&
+           !(PlumeRequestAbort && PlumeRequestAbort()))
+        SDL_Delay(50);
+    if (!SDL_GetAtomicInt(&req.done)) {
+        fprintf(stderr, "Streaming request abandoned (no answer, or quit asked)\n");
+        req.result = IHS_StreamingFailed;
+    }
+    IHS_ClientStop(client); /* no-op if a callback already stopped it */
     IHS_ClientThreadedJoin(client);
     IHS_ClientStopDiscovery(client);
     IHS_ClientDestroy(client);

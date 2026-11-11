@@ -50,6 +50,10 @@ void PlumeCleanName(char *s);
 
 /* Ask the host for a stream. `result` (may be NULL) tells Unauthorized (= not
  * paired) apart from the other failures. */
+/* Gives up after this long without a final answer from the host. */
+#define PLUME_REQUEST_TIMEOUT_MS 20000
+/* Optional, polled (main thread) while a request is pending: true = give up now. */
+extern bool (*PlumeRequestAbort)(void);
 bool PlumeRequestStream(const IHS_HostInfo *host, int maxWidth, int maxHeight, bool desktop,
                         int gamepadCount, IHS_SessionInfo *out, IHS_StreamingResult *result);
 

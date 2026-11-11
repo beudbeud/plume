@@ -49,7 +49,15 @@ static int g_scale = MEDIA_SCALE_FIT; /* fit / stretch / crop on aspect mismatch
 enum { EXIT_NO_HOST = 3, EXIT_NOT_PAIRED = 4 };
 
 static volatile sig_atomic_t g_term;
-static void OnTerm(int sig) { (void) sig; g_term = 1; }
+static void (*g_prevTerm)(int); /* SDL's handler: it queues SDL_EVENT_QUIT */
+/* alarm: SIGALRM's default action kills us if the clean exit is itself stuck,
+ * so SIGTERM ends plume within 5 s whatever state it is in. */
+static void OnTerm(int sig) { g_term = 1; alarm(5); if (g_prevTerm) g_prevTerm(sig); }
+static void InstallTerm(void) {
+    void (*old)(int) = signal(SIGTERM, OnTerm);
+    if (old != SIG_DFL && old != SIG_IGN && old != SIG_ERR && old != OnTerm) g_prevTerm = old;
+    signal(SIGINT, OnTerm);
+}
 
 static int DoPair(const IHS_HostInfo *host) {
     /* PIN the user must type into Steam on the host to approve this device. */
@@ -58,8 +66,7 @@ static int DoPair(const IHS_HostInfo *host) {
 
     /* The frontend kills us when its viewer backs out of the PIN screen: tear
      * the client down instead of dying mid-callback. */
-    signal(SIGTERM, OnTerm);
-    signal(SIGINT, OnTerm);
+    InstallTerm();
     PlumePairing p;
     if (!PlumePairStart(&p, host, pin)) return 1;
     printf("PIN %s\n", pin);
@@ -245,6 +252,7 @@ static SessionEnd RunSession(const IHS_SessionInfo *sinfo, bool audio) {
 
     bool disconnecting = false;
     bool stalled = false;
+    Uint64 disconnectAt = 0;
     Uint64 sessionStart = SDL_GetTicksNS();
     while (g_running) {
         bool hidDirty = false;
@@ -284,6 +292,10 @@ static SessionEnd RunSession(const IHS_SessionInfo *sinfo, bool audio) {
         }
         MediaPresent(); /* blocks on vsync, paces the loop */
 
+        /* disconnected() never fires if the session never got connected. */
+        if (disconnecting && !disconnectAt) disconnectAt = SDL_GetTicks();
+        if (disconnecting && SDL_GetTicks() - disconnectAt > 2000) break;
+
         /* IHSlib's keepalive only transmits — a hard link drop never fires
          * disconnected(), the picture just freezes. The host streams frames
          * continuously (even a static desktop), so a long silence IS the drop. */
@@ -308,19 +320,41 @@ static SessionEnd RunSession(const IHS_SessionInfo *sinfo, bool audio) {
     return disconnecting ? SESSION_USER_QUIT : SESSION_DROPPED;
 }
 
-/* Show `msg` for `ms` while watching for a cancel (Esc, East button, quit).
+/* Quit asked while no session is up (request pending, reconnect wait):
+ * SIGTERM / window close, Esc, East button, Hotkey+Start. Peeks, so the
+ * events stay queued and every later check agrees. Pads must be open. */
+static bool QuitAsked(void) {
+    SDL_Event ev[16];
+    SDL_PumpEvents();
+    if (g_term || SDL_HasEvent(SDL_EVENT_QUIT) || QuitComboHeld()) return true;
+    int n = SDL_PeepEvents(ev, 16, SDL_PEEKEVENT, SDL_EVENT_KEY_DOWN, SDL_EVENT_KEY_DOWN);
+    for (int i = 0; i < n; i++) if (ev[i].key.key == SDLK_ESCAPE) return true;
+    n = SDL_PeepEvents(ev, 16, SDL_PEEKEVENT, SDL_EVENT_GAMEPAD_BUTTON_DOWN, SDL_EVENT_GAMEPAD_BUTTON_DOWN);
+    for (int i = 0; i < n; i++) if (ev[i].gbutton.button == SDL_GAMEPAD_BUTTON_EAST) return true;
+    return false;
+}
+
+/* Between sessions nobody holds the pads (the HID provider owns them only
+ * while streaming), and a closed pad sends no button. */
+static int OpenPads(SDL_Gamepad *pads[8]) {
+    int n = 0, np = 0;
+    SDL_PumpEvents(); /* let SDL notice pads plugged since init */
+    SDL_JoystickID *ids = SDL_GetGamepads(&n);
+    for (int i = 0; ids && i < n && np < 8; i++) pads[np++] = SDL_OpenGamepad(ids[i]);
+    SDL_free(ids);
+    return np;
+}
+static void ClosePads(SDL_Gamepad *pads[8], int np) {
+    for (int i = 0; i < np; i++) if (pads[i]) SDL_CloseGamepad(pads[i]);
+}
+
+/* Show `msg` for `ms` while watching for a cancel (see QuitAsked).
  * Returns false when the user cancelled. */
 static bool ReconnectWait(const char *msg, int ms) {
     Uint64 until = SDL_GetTicks() + (Uint64) ms;
     do {
-        SDL_Event e;
-        while (SDL_PollEvent(&e)) {
-            if (e.type == SDL_EVENT_QUIT ||
-                (e.type == SDL_EVENT_KEY_DOWN && e.key.key == SDLK_ESCAPE) ||
-                (e.type == SDL_EVENT_GAMEPAD_BUTTON_DOWN &&
-                 e.gbutton.button == SDL_GAMEPAD_BUTTON_EAST))
-                return false;
-        }
+        if (QuitAsked()) return false;
+        SDL_FlushEvents(SDL_EVENT_FIRST, SDL_EVENT_LAST);
         UIMessage(g_renderer, msg);
         SDL_Delay(50);
     } while (SDL_GetTicks() < until);
@@ -337,13 +371,19 @@ static int StreamLoop(const IHS_HostInfo *host, IHS_SessionInfo sinfo, bool audi
         /* The link died under us (Wi-Fi blip, host hiccup). The old grant is
          * spent — ask the host for a fresh session and resume, a few times,
          * before giving the user their menu back. */
-        bool got = false;
-        for (int i = 1; i <= RECONNECT_TRIES && !got; i++) {
+        bool got = false, cancelled = false;
+        SDL_Gamepad *pads[8];
+        int np = OpenPads(pads);
+        for (int i = 1; i <= RECONNECT_TRIES && !got && !cancelled; i++) {
             char msg[64];
             snprintf(msg, sizeof(msg), "Connection lost - reconnecting (%d/%d)...", i, RECONNECT_TRIES);
-            if (!ReconnectWait(msg, i == 1 ? 500 : 2000)) return 0; /* user cancelled */
-            got = PlumeRequestStream(host, g_width, g_height, g_desktop, PlumeCountGamepads(), &sinfo, NULL);
+            cancelled = !ReconnectWait(msg, i == 1 ? 500 : 2000);
+            if (!cancelled)
+                got = PlumeRequestStream(host, g_width, g_height, g_desktop, PlumeCountGamepads(), &sinfo, NULL);
+            cancelled = cancelled || (!got && QuitAsked());
         }
+        ClosePads(pads, np); /* the next session's HID provider opens its own */
+        if (cancelled) return 0;
         if (!got) return 1;
     }
 }
@@ -446,9 +486,15 @@ int main(int argc, char *argv[]) {
     /* --host: ask before taking the display, so "not paired" hands the screen
      * straight back to the frontend's pairing page without a window flash. */
     IHS_SessionInfo sinfo;
+    InstallTerm(); /* after SDL_Init: chains to SDL's own handler */
+    PlumeRequestAbort = QuitAsked;
     if (hostIp) {
         IHS_StreamingResult res;
-        if (!PlumeRequestStream(&host, g_width, g_height, g_desktop, PlumeCountGamepads(), &sinfo, &res)) {
+        SDL_Gamepad *pads[8];
+        int np = OpenPads(pads);
+        bool got = PlumeRequestStream(&host, g_width, g_height, g_desktop, PlumeCountGamepads(), &sinfo, &res);
+        ClosePads(pads, np);
+        if (!got) {
             SDL_Quit();
             IHS_Quit();
             return res == IHS_StreamingUnauthorized ? EXIT_NOT_PAIRED : 1;
