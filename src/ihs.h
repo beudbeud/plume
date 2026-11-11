@@ -54,7 +54,7 @@ void PlumeCleanName(char *s);
 #define PLUME_REQUEST_TIMEOUT_MS 20000
 /* Optional, polled (main thread) while a request is pending: true = give up now. */
 extern bool (*PlumeRequestAbort)(void);
-bool PlumeRequestStream(const IHS_HostInfo *host, int maxWidth, int maxHeight, bool desktop,
+bool PlumeRequestStream(const IHS_HostInfo *host, int maxWidth, int maxHeight, int maxFps, bool desktop,
                         int gamepadCount, IHS_SessionInfo *out, IHS_StreamingResult *result);
 
 /* The secret negotiated with one host at pairing, kept next to creds.bin.

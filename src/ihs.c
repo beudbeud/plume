@@ -373,7 +373,7 @@ static void OnStreamFailed(IHS_Client *c, const IHS_HostInfo *h, IHS_StreamingRe
 }
 static void OnStreamProgress(IHS_Client *c, const IHS_HostInfo *h, void *ctx) { (void)c;(void)h;(void)ctx; }
 
-bool PlumeRequestStream(const IHS_HostInfo *host, int maxWidth, int maxHeight, bool desktop,
+bool PlumeRequestStream(const IHS_HostInfo *host, int maxWidth, int maxHeight, int maxFps, bool desktop,
                         int gamepadCount, IHS_SessionInfo *out, IHS_StreamingResult *result) {
     IHS_Client *client = IHS_ClientCreate(&PlumeClientConfig);
     if (!client) {
@@ -392,6 +392,7 @@ bool PlumeRequestStream(const IHS_HostInfo *host, int maxWidth, int maxHeight, b
     IHS_StreamingRequest r = {
             .streamingEnable = {true, true, true},
             .maxResolution = {maxWidth, maxHeight},
+            .maxFps = maxFps,
             .audioChannelCount = 2,
             /* Desktop off means we want the host's Big Picture / game session. */
             .streamingInterface = desktop ? IHS_StreamInterfaceDesktop : IHS_StreamInterfaceBigPicture,

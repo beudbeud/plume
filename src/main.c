@@ -381,7 +381,7 @@ static int StreamLoop(const IHS_HostInfo *host, IHS_SessionInfo sinfo, bool audi
             snprintf(msg, sizeof(msg), "Connection lost - reconnecting (%d/%d)...", i, RECONNECT_TRIES);
             cancelled = !ReconnectWait(msg, i == 1 ? 500 : 2000);
             if (!cancelled)
-                got = PlumeRequestStream(host, g_width, g_height, g_desktop, PlumeCountGamepads(), &sinfo, NULL);
+                got = PlumeRequestStream(host, g_width, g_height, g_fps, g_desktop, PlumeCountGamepads(), &sinfo, NULL);
             cancelled = cancelled || (!got && QuitAsked());
         }
         ClosePads(pads, np); /* the next session's HID provider opens its own */
@@ -393,11 +393,11 @@ static int StreamLoop(const IHS_HostInfo *host, IHS_SessionInfo sinfo, bool audi
 static int DoStream(const IHS_HostInfo *host, bool audio) {
     IHS_SessionInfo sinfo;
     IHS_StreamingResult res;
-    if (!PlumeRequestStream(host, g_width, g_height, g_desktop, PlumeCountGamepads(), &sinfo, &res)) {
+    if (!PlumeRequestStream(host, g_width, g_height, g_fps, g_desktop, PlumeCountGamepads(), &sinfo, &res)) {
         /* Not paired yet -> pair from the UI, then retry once. */
         if (res != IHS_StreamingUnauthorized) return 1;
         if (!PairScreen(g_renderer, host)) return 1;
-        if (!PlumeRequestStream(host, g_width, g_height, g_desktop, PlumeCountGamepads(), &sinfo, &res)) return 1;
+        if (!PlumeRequestStream(host, g_width, g_height, g_fps, g_desktop, PlumeCountGamepads(), &sinfo, &res)) return 1;
     }
     return StreamLoop(host, sinfo, audio);
 }
@@ -494,7 +494,7 @@ int main(int argc, char *argv[]) {
         IHS_StreamingResult res;
         SDL_Gamepad *pads[8];
         int np = OpenPads(pads);
-        bool got = PlumeRequestStream(&host, g_width, g_height, g_desktop, PlumeCountGamepads(), &sinfo, &res);
+        bool got = PlumeRequestStream(&host, g_width, g_height, g_fps, g_desktop, PlumeCountGamepads(), &sinfo, &res);
         ClosePads(pads, np);
         if (!got) {
             SDL_Quit();
