@@ -400,6 +400,15 @@ bool PlumeRequestStream(const IHS_HostInfo *host, int maxWidth, int maxHeight, b
     };
     /* Discovery keeps the worker thread alive and the socket serviced; without
      * it ThreadedJoin returns instantly and the request is never delivered. */
+    /* Debug knobs for a host that reacts to these fields (black Big Picture
+     * on a Linux host): try values without a rebuild. */
+    const char *env = getenv("PLUME_STREAM_INTERFACE"); /* 0 default, 1 recent games, 2 Big Picture, 3 desktop */
+    if (env && env[0] >= '0' && env[0] <= '3' && !env[1]) r.streamingInterface = (IHS_StreamInterface) (env[0] - '0');
+    r.deviceVersion = getenv("PLUME_DEVICE_VERSION"); /* NULL: IHSlib's default */
+    env = getenv("PLUME_FORM_FACTOR"); /* 1 phone, 2 tablet, 3 computer, 4 TV (default), 5 VR headset */
+    if (env && env[0] >= '1' && env[0] <= '5' && !env[1]) r.formFactor = env[0] - '0';
+    fprintf(stderr, "Streaming request: interface=%d desktop=%d version=%s form_factor=%d\n", r.streamingInterface,
+            r.streamDesktop, r.deviceVersion ? r.deviceVersion : "default", r.formFactor ? r.formFactor : 4);
     IHS_ClientStartDiscovery(client, 0);
     IHS_ClientStreamingRequest(client, host, &r);
     /* A host that keeps answering "in progress" resets IHSlib's own 15 s

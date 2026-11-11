@@ -150,6 +150,8 @@ static void OnConfiguring(IHS_Session *s, IHS_SessionConfig *cfg, void *ctx) {
     cfg->maxHeight = g_height;
     cfg->maxFps = g_fps;
     cfg->maxBitrateKbps = g_kbps;
+    const char *ff = getenv("PLUME_FORM_FACTOR"); /* debug knob, see PlumeRequestStream */
+    if (ff && ff[0] >= '1' && ff[0] <= '5' && !ff[1]) cfg->formFactor = ff[0] - '0';
 }
 
 /* SDL mouse button -> IHS button. */
