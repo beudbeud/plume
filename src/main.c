@@ -1,19 +1,28 @@
 /* Plume — a Steam Remote Play client built on IHSlib.
  *
- *   plume                 discover a host, request a stream, and play it
- *   plume --pair          pair with a host (enter the shown PIN in Steam)
- *   plume --host <ip>     target a specific host instead of the first found
+ *   plume                 open the launcher: pick a host, stream it
+ *   plume --host <ip>     stream that host directly, exit when the stream ends
+ *   plume --pair [--host <ip>]   pair headlessly; stdout: "PIN <4 digits>"
+ *   plume --discover      list hosts, one "<ip>\t?\t<hostname>" line each
+ *   plume --timeout <s>   discovery timeout (3 for --discover, else 10)
+ *   plume --width/--height/--fps/--kbps <n>   override settings.conf for this run
  *   plume --no-audio      video only
  *   plume --verbose       show IHSlib/decoder chatter, not just problems
  *
  * Linux amd64 + arm64: nothing here is arch-specific; FFmpeg software decode
  * works on both, and picks hardware/threaded paths where available.
+ *
+ * A frontend drives the headless modes, so their stdout and exit codes are a
+ * contract: stdout carries only the lines above (everything else is stderr), and
+ * 0 = ok, 1 = failure, 2 = usage, 3 = host not found, 4 = not paired / pairing
+ * refused by the host.
  */
 #define _DEFAULT_SOURCE  /* gethostname, mkdir */
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
+#include <signal.h>
 #include <sys/stat.h>
 
 #include <SDL3/SDL.h>
@@ -37,16 +46,30 @@ static bool g_desktop = true; /* stream the host's desktop, else its game sessio
 static int g_scale = MEDIA_SCALE_FIT; /* fit / stretch / crop on aspect mismatch */
 
 /* ------------------------------ pairing ----------------------------------- */
+enum { EXIT_NO_HOST = 3, EXIT_NOT_PAIRED = 4 };
+
+static volatile sig_atomic_t g_term;
+static void OnTerm(int sig) { (void) sig; g_term = 1; }
+
 static int DoPair(const IHS_HostInfo *host) {
     /* PIN the user must type into Steam on the host to approve this device. */
     char pin[5];
     PlumeMakePin(pin);
-    printf("\n  Enter this PIN in Steam on the host to approve:  %s\n\n", pin);
 
+    /* The frontend kills us when its viewer backs out of the PIN screen: tear
+     * the client down instead of dying mid-callback. */
+    signal(SIGTERM, OnTerm);
+    signal(SIGINT, OnTerm);
     PlumePairing p;
     if (!PlumePairStart(&p, host, pin)) return 1;
-    while (!SDL_GetAtomicInt(&p.done)) SDL_Delay(100); /* nothing to draw here; just wait it out */
-    return PlumePairFinish(&p) ? 0 : 1;
+    printf("PIN %s\n", pin);
+    fflush(stdout); /* a pipe is block-buffered; the reader needs it now */
+    fprintf(stderr, "Enter this PIN in Steam on %s to approve this device.\n", host->hostname);
+
+    while (!SDL_GetAtomicInt(&p.done) && !g_term) SDL_Delay(100);
+    bool answered = SDL_GetAtomicInt(&p.done);
+    if (PlumePairFinish(&p)) return 0;
+    return answered ? EXIT_NOT_PAIRED : 1; /* the host said no / we were stopped */
 }
 
 /* ------------------------------- session ---------------------------------- */
@@ -306,16 +329,8 @@ static bool ReconnectWait(const char *msg, int ms) {
 
 #define RECONNECT_TRIES 5
 
-static int DoStream(const IHS_HostInfo *host, bool audio) {
-    IHS_SessionInfo sinfo;
-    IHS_StreamingResult res;
-    if (!PlumeRequestStream(host, g_width, g_height, g_desktop, PlumeCountGamepads(), &sinfo, &res)) {
-        /* Not paired yet -> pair from the UI, then retry once. */
-        if (res != IHS_StreamingUnauthorized) return 1;
-        if (!PairScreen(g_renderer, host)) return 1;
-        if (!PlumeRequestStream(host, g_width, g_height, g_desktop, PlumeCountGamepads(), &sinfo, &res)) return 1;
-    }
-
+/* Play a granted stream until the user leaves or reconnecting gives up. */
+static int StreamLoop(const IHS_HostInfo *host, IHS_SessionInfo sinfo, bool audio) {
     for (;;) {
         SessionEnd end = RunSession(&sinfo, audio);
         if (end != SESSION_DROPPED) return end == SESSION_USER_QUIT ? 0 : 1;
@@ -333,9 +348,29 @@ static int DoStream(const IHS_HostInfo *host, bool audio) {
     }
 }
 
+static int DoStream(const IHS_HostInfo *host, bool audio) {
+    IHS_SessionInfo sinfo;
+    IHS_StreamingResult res;
+    if (!PlumeRequestStream(host, g_width, g_height, g_desktop, PlumeCountGamepads(), &sinfo, &res)) {
+        /* Not paired yet -> pair from the UI, then retry once. */
+        if (res != IHS_StreamingUnauthorized) return 1;
+        if (!PairScreen(g_renderer, host)) return 1;
+        if (!PlumeRequestStream(host, g_width, g_height, g_desktop, PlumeCountGamepads(), &sinfo, &res)) return 1;
+    }
+    return StreamLoop(host, sinfo, audio);
+}
+
+/* "--name <n>" with n > 0; anything else falls through to the usage line. */
+static bool IntFlag(int argc, char *argv[], int *i, const char *name, int *out) {
+    if (strcmp(argv[*i], name) || *i + 1 >= argc || atoi(argv[*i + 1]) <= 0) return false;
+    *out = atoi(argv[++*i]);
+    return true;
+}
+
 /* -------------------------------- main ------------------------------------ */
 int main(int argc, char *argv[]) {
-    bool pair = false;
+    bool pair = false, discover = false;
+    int timeout = 0; /* seconds; 0 = the mode's default */
     const char *hostIp = NULL;
     /* --verbose is read first: LoadSettings already logs. */
     for (int i = 1; i < argc; i++) if (!strcmp(argv[i], "--verbose")) PlumeVerbose = true;
@@ -343,13 +378,21 @@ int main(int argc, char *argv[]) {
     LoadSettings(); /* before argv, so flags win over the saved file */
     for (int i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "--pair")) pair = true;
+        else if (!strcmp(argv[i], "--discover")) discover = true;
+        else if (IntFlag(argc, argv, &i, "--timeout", &timeout)) ;
+        else if (IntFlag(argc, argv, &i, "--width", &g_width)) ;
+        else if (IntFlag(argc, argv, &i, "--height", &g_height)) ;
+        else if (IntFlag(argc, argv, &i, "--fps", &g_fps)) ;
+        else if (IntFlag(argc, argv, &i, "--kbps", &g_kbps)) ;
         else if (!strcmp(argv[i], "--no-audio")) g_audio = false;
         else if (!strcmp(argv[i], "--no-desktop")) g_desktop = false;
         else if (!strcmp(argv[i], "--hevc")) g_hevc = true;
         else if (!strcmp(argv[i], "--verbose")) ; /* handled above */
         else if (!strcmp(argv[i], "--host") && i + 1 < argc) hostIp = argv[++i];
         else {
-            fprintf(stderr, "usage: %s [--pair] [--host <ip>] [--no-audio] [--no-desktop] [--hevc] [--verbose]\n", argv[0]);
+            fprintf(stderr, "usage: %s [--discover | --pair] [--host <ip>] [--timeout <sec>]\n"
+                            "       [--width <n>] [--height <n>] [--fps <n>] [--kbps <n>]\n"
+                            "       [--no-audio] [--no-desktop] [--hevc] [--verbose]\n", argv[0]);
             return 2;
         }
     }
@@ -359,22 +402,54 @@ int main(int argc, char *argv[]) {
     IHS_Init();
     PlumeInitCreds();
 
-    /* --pair keeps the headless flow: discover one host, pair, exit. */
+    /* Headless: every host that answers, one tab-separated line each. */
+    if (discover) {
+        IHS_HostInfo found[16];
+        int n = PlumeDiscoverAll(timeout ? timeout : 3, found, 16);
+        for (int i = 0; i < n; i++) {
+            char *ip = IHS_IPAddressToString(&found[i].address.ip);
+            PlumeCleanName(found[i].hostname);
+            /* "?": the status broadcast doesn't say whether this device is
+             * approved; only a stream request does, and that wakes the host. */
+            if (ip) printf("%s\t?\t%s\n", ip, found[i].hostname);
+            free(ip);
+        }
+        IHS_Quit();
+        return 0;
+    }
+
+    /* --pair and --host both target one host; neither opens the launcher. */
+    IHS_HostInfo host;
+    if (pair || hostIp) {
+        fprintf(stderr, "Discovering hosts%s...\n", hostIp ? " (filtered)" : "");
+        if (!PlumeDiscoverHost(hostIp, timeout ? timeout : 10, &host)) {
+            fprintf(stderr, "No host found. Is Steam running on the LAN with Remote Play enabled?\n");
+            IHS_Quit();
+            return EXIT_NO_HOST;
+        }
+    }
     if (pair) {
-        IHS_HostInfo host;
-        printf("Discovering hosts%s...\n", hostIp ? " (filtered)" : ""); /* --pair is interactive: always shown */
-        int rc = 1;
-        if (PlumeDiscoverHost(hostIp, 10, &host)) rc = DoPair(&host);
-        else fprintf(stderr, "No host found. Is Steam running on the LAN with Remote Play enabled?\n");
+        int rc = DoPair(&host);
         IHS_Quit();
         return rc;
     }
 
-    /* Launcher UI. */
     if (!SDL_Init(SDL_INIT_VIDEO | SDL_INIT_AUDIO | SDL_INIT_GAMEPAD) || !TTF_Init()) {
         fprintf(stderr, "SDL/TTF init failed: %s\n", SDL_GetError());
         IHS_Quit();
         return 1;
+    }
+
+    /* --host: ask before taking the display, so "not paired" hands the screen
+     * straight back to the frontend's pairing page without a window flash. */
+    IHS_SessionInfo sinfo;
+    if (hostIp) {
+        IHS_StreamingResult res;
+        if (!PlumeRequestStream(&host, g_width, g_height, g_desktop, PlumeCountGamepads(), &sinfo, &res)) {
+            SDL_Quit();
+            IHS_Quit();
+            return res == IHS_StreamingUnauthorized ? EXIT_NOT_PAIRED : 1;
+        }
     }
     g_window = SDL_CreateWindow("Plume", 1280, 720,
                                 SDL_WINDOW_RESIZABLE | SDL_WINDOW_FULLSCREEN);
@@ -392,7 +467,9 @@ int main(int argc, char *argv[]) {
         return 1;
     }
 
-    for (;;) {
+    int rc = 0;
+    if (hostIp) rc = StreamLoop(&host, sinfo, g_audio); /* no launcher, no SaveSettings */
+    else for (;;) {
         UIResult r = {.hevc = g_hevc, .audio = g_audio, .desktop = g_desktop, .scale = g_scale,
                       .width = g_width, .height = g_height, .fps = g_fps, .kbps = g_kbps};
         UIAction act = RunMenu(g_window, g_renderer, &PlumeClientConfig, &r);
@@ -409,5 +486,5 @@ int main(int argc, char *argv[]) {
     TTF_Quit();
     SDL_Quit();
     IHS_Quit();
-    return 0;
+    return rc;
 }

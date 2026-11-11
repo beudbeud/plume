@@ -41,6 +41,13 @@ void PlumeLog(IHS_LogLevel level, const char *tag, const char *message);
 /* Discover with a timeout (seconds). wantIp NULL accepts the first host. */
 bool PlumeDiscoverHost(const char *wantIp, int timeoutSec, IHS_HostInfo *out);
 
+/* Every host answering within timeoutSec, deduplicated. Returns the count. */
+int PlumeDiscoverAll(int timeoutSec, IHS_HostInfo *out, int max);
+
+/* Control characters -> spaces, in place: a hostname comes off the wire and
+ * --discover prints it into a tab-separated line somebody parses. */
+void PlumeCleanName(char *s);
+
 /* Ask the host for a stream. `result` (may be NULL) tells Unauthorized (= not
  * paired) apart from the other failures. */
 bool PlumeRequestStream(const IHS_HostInfo *host, int maxWidth, int maxHeight, bool desktop,

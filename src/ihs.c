@@ -181,7 +181,7 @@ static void OnDiscovered(IHS_Client *client, const IHS_HostInfo *info, void *ctx
     }
     p->host = *info;
     SDL_SetAtomicInt(&p->found, 1);
-    if (PlumeVerbose) printf("Found host: %s\n", info->hostname);
+    if (PlumeVerbose) fprintf(stderr, "Found host: %s\n", info->hostname);
     IHS_ClientStop(client);
 }
 
@@ -209,10 +209,42 @@ bool PlumeDiscoverHost(const char *wantIp, int timeoutSec, IHS_HostInfo *out) {
     return true;
 }
 
+/* ---------------- discovery: every host that answers in time -------------- */
+typedef struct { IHS_HostInfo *out; int max, n; } HostList; /* worker thread only, read after join */
+
+static void OnDiscoveredAll(IHS_Client *client, const IHS_HostInfo *info, void *ctx) {
+    (void) client;
+    HostList *l = ctx;
+    for (int i = 0; i < l->n; i++) if (l->out[i].clientId == info->clientId) return; /* re-broadcast answer */
+    if (l->n < l->max) l->out[l->n++] = *info;
+}
+
+static const IHS_ClientDiscoveryCallbacks DISCOVER_ALL_CALLBACKS = {.discovered = OnDiscoveredAll};
+
+int PlumeDiscoverAll(int timeoutSec, IHS_HostInfo *out, int max) {
+    IHS_Client *client = IHS_ClientCreate(&PlumeClientConfig);
+    if (!client) return 0;
+    IHS_ClientSetLogFunction(client, PlumeLog);
+    HostList list = {out, max, 0};
+    IHS_ClientSetDiscoveryCallbacks(client, &DISCOVER_ALL_CALLBACKS, &list);
+    IHS_ClientStartDiscovery(client, 1000);
+    SDL_Delay((Uint32) timeoutSec * 1000);
+    IHS_ClientStopDiscovery(client);
+    IHS_ClientStop(client);
+    IHS_ClientThreadedJoin(client);
+    IHS_ClientDestroy(client);
+    return list.n;
+}
+
+void PlumeCleanName(char *s) {
+    for (; *s; s++) if ((unsigned char) *s < 0x20 || *s == 0x7f) *s = ' ';
+}
+
 /* ------------------------------- pairing ---------------------------------- */
 static void OnAuthSuccess(IHS_Client *c, const IHS_HostInfo *h, uint64_t steamId, void *ctx) {
     (void) h;
-    printf("Paired (steamId=%llu)\n", (unsigned long long) steamId);
+    /* stderr: stdout belongs to whoever is parsing --pair / --discover. */
+    fprintf(stderr, "Paired (steamId=%llu)\n", (unsigned long long) steamId);
     PlumePairing *p = ctx;
     SDL_SetAtomicInt(&p->ok, 1);
     SDL_SetAtomicInt(&p->done, 1);

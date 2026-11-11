@@ -91,8 +91,19 @@ host gets you `640x360`, not a 4:3 picture. To fill a 4:3 display, set Scaling t
 Stretch or Crop.
 
 The same values are overridable per-run on the command line, which wins over the
-saved file: `--no-audio`, `--no-desktop`, `--hevc`, `--host <ip>` (only with
-`--pair`).
+saved file: `--no-audio`, `--no-desktop`, `--hevc`, `--width`/`--height`/`--fps`/`--kbps <n>`.
+
+### Driving plume from a frontend
+
+Three modes skip the launcher. stdout carries only the lines below; everything
+else goes to stderr. Exit codes: 0 ok, 1 failure, 2 usage, 3 host not found,
+4 not paired / pairing refused.
+
+| Command | Does |
+|---|---|
+| `plume --discover [--timeout <s>]` | Lists every host answering within 3 s, one `<ip>\t?\t<hostname>` line each. The middle column is the paired state, always `?`: discovery doesn't reveal it. |
+| `plume --pair [--host <ip>]` | Prints `PIN <4 digits>`, then waits for the host. SIGTERM aborts cleanly. |
+| `plume --host <ip>` | Streams that host and exits when the stream ends (4 if it isn't paired yet). |
 
 By default only problems are printed. `--verbose` adds the IHSlib protocol trace
 and the decoder's chatter.

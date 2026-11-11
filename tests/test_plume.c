@@ -29,6 +29,11 @@ static bool FileHolds(const char *path, const char *want) {
 }
 
 int main(void) {
+    /* --discover's line format is a contract: no tab or newline may survive */
+    char name[] = "my\tgaming\npc \x7f";
+    PlumeCleanName(name);
+    assert(strcmp(name, "my gaming pc  ") == 0);
+
     /* -- PlumeResIndex: exact match, width disambiguates 480-line modes, and an
      * unknown size falls back to 1080p -- */
     assert(strcmp(PlumeResList[PlumeResIndex(854, 480)].label, "480p") == 0);
