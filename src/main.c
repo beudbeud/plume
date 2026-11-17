@@ -48,11 +48,11 @@ static int g_scale = MEDIA_SCALE_FIT; /* fit / stretch / crop on aspect mismatch
 /* ------------------------------ pairing ----------------------------------- */
 enum { EXIT_NO_HOST = 3, EXIT_NOT_PAIRED = 4 };
 
-static volatile sig_atomic_t g_term;
+volatile sig_atomic_t PlumeTerm; /* extern in ui.h: the launcher screens poll it */
 static void (*g_prevTerm)(int); /* SDL's handler: it queues SDL_EVENT_QUIT */
 /* alarm: SIGALRM's default action kills us if the clean exit is itself stuck,
  * so SIGTERM ends plume within 5 s whatever state it is in. */
-static void OnTerm(int sig) { g_term = 1; alarm(5); if (g_prevTerm) g_prevTerm(sig); }
+static void OnTerm(int sig) { PlumeTerm = 1; alarm(5); if (g_prevTerm) g_prevTerm(sig); }
 static void InstallTerm(void) {
     void (*old)(int) = signal(SIGTERM, OnTerm);
     if (old != SIG_DFL && old != SIG_IGN && old != SIG_ERR && old != OnTerm) g_prevTerm = old;
@@ -73,7 +73,7 @@ static int DoPair(const IHS_HostInfo *host) {
     fflush(stdout); /* a pipe is block-buffered; the reader needs it now */
     fprintf(stderr, "Enter this PIN in Steam on %s to approve this device.\n", host->hostname);
 
-    while (!SDL_GetAtomicInt(&p.done) && !g_term) SDL_Delay(100);
+    while (!SDL_GetAtomicInt(&p.done) && !PlumeTerm) SDL_Delay(100);
     bool answered = SDL_GetAtomicInt(&p.done);
     if (PlumePairFinish(&p)) return 0;
     return answered ? EXIT_NOT_PAIRED : 1; /* the host said no / we were stopped */
@@ -181,7 +181,9 @@ static bool ForwardInput(IHS_Session *s, const SDL_Event *e) {
             IHS_SessionSendMouseUp(s, MapButton(e->button.button));
             break;
         case SDL_EVENT_MOUSE_WHEEL:
-            IHS_SessionSendMouseWheel(s, e->wheel.y >= 0 ? IHS_MOUSE_WHEEL_UP : IHS_MOUSE_WHEEL_DOWN);
+            /* y == 0 is a horizontal-only scroll, which the host has no wheel for. */
+            if (e->wheel.y != 0)
+                IHS_SessionSendMouseWheel(s, e->wheel.y > 0 ? IHS_MOUSE_WHEEL_UP : IHS_MOUSE_WHEEL_DOWN);
             break;
         case SDL_EVENT_KEY_DOWN:
             /* SDL scancodes are USB HID usages, which is what IHSlib expects. */
@@ -328,7 +330,7 @@ static SessionEnd RunSession(const IHS_SessionInfo *sinfo, bool audio) {
 static bool QuitAsked(void) {
     SDL_Event ev[16];
     SDL_PumpEvents();
-    if (g_term || SDL_HasEvent(SDL_EVENT_QUIT) || QuitComboHeld()) return true;
+    if (PlumeTerm || SDL_HasEvent(SDL_EVENT_QUIT) || QuitComboHeld()) return true;
     int n = SDL_PeepEvents(ev, 16, SDL_PEEKEVENT, SDL_EVENT_KEY_DOWN, SDL_EVENT_KEY_DOWN);
     for (int i = 0; i < n; i++) if (ev[i].key.key == SDLK_ESCAPE) return true;
     n = SDL_PeepEvents(ev, 16, SDL_PEEKEVENT, SDL_EVENT_GAMEPAD_BUTTON_DOWN, SDL_EVENT_GAMEPAD_BUTTON_DOWN);
@@ -450,7 +452,6 @@ int main(int argc, char *argv[]) {
         int n = PlumeDiscoverAll(timeout ? timeout : 3, found, 16);
         for (int i = 0; i < n; i++) {
             char *ip = IHS_IPAddressToString(&found[i].address.ip);
-            PlumeCleanName(found[i].hostname);
             /* The status broadcast doesn't say whether this device is approved;
              * only a stream request does, and that wakes the host. What we do
              * know is whether we hold a key for it: "1", else "?" (it may still

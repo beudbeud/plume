@@ -2,6 +2,7 @@
  * navigable by keyboard and gamepad. */
 #pragma once
 
+#include <signal.h>
 #include <SDL3/SDL.h>
 #include <SDL3_ttf/SDL_ttf.h>
 #include "ihslib.h"
@@ -19,6 +20,11 @@ typedef struct {
     int fps;             /* settings: cap on the host's framerate */
     int kbps;            /* settings: cap on the host's bitrate, scaled to resolution */
 } UIResult;
+
+/* Set by main.c's SIGTERM/SIGINT handler. Every screen loop checks it: the
+ * SDL_EVENT_QUIT the signal also queues is one-shot, and a flush, the launch
+ * grace period or a sub-screen can eat it. */
+extern volatile sig_atomic_t PlumeTerm;
 
 /* Fonts are owned by the UI, sized from the real render output, and re-sized if
  * the output mode changes. Call once after renderer creation; screens call it

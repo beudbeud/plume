@@ -214,6 +214,16 @@ static int VideoStart(IHS_Session *session, const IHS_StreamVideoConfig *config,
         vctx->width = (int) config->width;
         vctx->height = (int) config->height;
         vctx->thread_count = 0; /* auto: one thread per core */
+        /* The hwaccel shape is the software decoder plus a device context:
+         * without the context this attempt IS software, so say so and tune for it. */
+        if (useHw && hwType != AV_HWDEVICE_TYPE_NONE) {
+            if (av_hwdevice_ctx_create(&hwDeviceCtx, hwType, NULL, NULL, 0) == 0) {
+                vctx->hw_device_ctx = av_buffer_ref(hwDeviceCtx);
+                vctx->get_format = GetHwFormat;
+            } else {
+                useHw = false;
+            }
+        }
         if (useHw) {
             /* Hardware decode is single-frame-latency anyway; ask for it explicitly. */
             vctx->flags |= AV_CODEC_FLAG_LOW_DELAY;
@@ -226,11 +236,6 @@ static int VideoStart(IHS_Session *session, const IHS_StreamVideoConfig *config,
              * slice threading buys nothing — the flag would pin 1440p60 H264 to a
              * single core. Trade ~thread_count frames of latency for keeping up. */
             vctx->thread_type = FF_THREAD_FRAME | FF_THREAD_SLICE;
-        }
-        if (useHw && hwType != AV_HWDEVICE_TYPE_NONE &&
-            av_hwdevice_ctx_create(&hwDeviceCtx, hwType, NULL, NULL, 0) == 0) {
-            vctx->hw_device_ctx = av_buffer_ref(hwDeviceCtx);
-            vctx->get_format = GetHwFormat;
         }
         if (avcodec_open2(vctx, codec, NULL) == 0) {
             SDL_Log("video decoder: %s (%s)", codec->name, useHw ? "hardware" : "software");
@@ -527,6 +532,12 @@ static int AudioStart(IHS_Session *session, const IHS_StreamAudioConfig *config,
     if (!audioEnabled) return 0;
     if (config->codec != IHS_StreamAudioCodecOpus) {
         SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION, "unsupported audio codec %d, muting", config->codec);
+        audioEnabled = false;
+        return 0;
+    }
+    /* Off the wire, and AudioSubmit divides by it into a stereo-sized buffer. */
+    if (config->channels < 1 || config->channels > 2) {
+        SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION, "unsupported audio channel count %d, muting", (int) config->channels);
         audioEnabled = false;
         return 0;
     }

@@ -210,8 +210,9 @@ static void OnDiscovered(IHS_Client *client, const IHS_HostInfo *info, void *ctx
         if (!match) return;
     }
     p->host = *info;
+    PlumeCleanName(p->host.hostname);
     SDL_SetAtomicInt(&p->found, 1);
-    if (PlumeVerbose) fprintf(stderr, "Found host: %s\n", info->hostname);
+    if (PlumeVerbose) fprintf(stderr, "Found host: %s\n", p->host.hostname);
     IHS_ClientStop(client);
 }
 
@@ -246,7 +247,10 @@ static void OnDiscoveredAll(IHS_Client *client, const IHS_HostInfo *info, void *
     (void) client;
     HostList *l = ctx;
     for (int i = 0; i < l->n; i++) if (l->out[i].clientId == info->clientId) return; /* re-broadcast answer */
-    if (l->n < l->max) l->out[l->n++] = *info;
+    if (l->n < l->max) {
+        l->out[l->n] = *info;
+        PlumeCleanName(l->out[l->n++].hostname);
+    }
 }
 
 static const IHS_ClientDiscoveryCallbacks DISCOVER_ALL_CALLBACKS = {.discovered = OnDiscoveredAll};

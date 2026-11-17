@@ -15,11 +15,13 @@ static int hostCount;
 
 static void OnDiscovered(IHS_Client *client, const IHS_HostInfo *info, void *ctx) {
     (void) client; (void) ctx;
+    IHS_HostInfo host = *info;
+    PlumeCleanName(host.hostname); /* off the wire, and it gets drawn and logged */
     SDL_LockMutex(hostLock);
     for (int i = 0; i < hostCount; i++) {
-        if (hosts[i].clientId == info->clientId) { hosts[i] = *info; goto done; } /* refresh */
+        if (hosts[i].clientId == host.clientId) { hosts[i] = host; goto done; } /* refresh */
     }
-    if (hostCount < MAX_HOSTS) hosts[hostCount++] = *info;
+    if (hostCount < MAX_HOSTS) hosts[hostCount++] = host;
     done:
     SDL_UnlockMutex(hostLock);
 }
@@ -410,7 +412,7 @@ static void SettingsScreen(SDL_Renderer *renderer, SDL_Gamepad *pad, int *resIdx
         } \
     } while (0)
 
-    while (running) {
+    while (running && !PlumeTerm) {
         int ndx, ndy;
         if (NavPoll(&nav, pad, &ndx, &ndy)) {
             if (ndy < 0 && focus > 0) focus--;
@@ -506,6 +508,7 @@ static bool ConfirmQuit(SDL_Renderer *renderer, SDL_Gamepad *pad) {
     SDL_PumpEvents();
     SDL_FlushEvents(SDL_EVENT_FIRST, SDL_EVENT_LAST);
     while (decided < 0) {
+        if (PlumeTerm) { decided = 1; break; }
         int ndx, ndy;
         if (NavPoll(&nav, pad, &ndx, &ndy) && ndx) yes = !yes;
         SDL_Event e;
@@ -604,6 +607,7 @@ bool PairScreen(SDL_Renderer *renderer, const IHS_HostInfo *host) {
                 (e.type == SDL_EVENT_GAMEPAD_BUTTON_DOWN && BtnIsBack(e.gbutton.which, e.gbutton.button)))
                 cancelled = true;
         }
+        if (PlumeTerm) cancelled = true;
         UIEnsureFonts(renderer);
         TTF_Font *font = uiFont, *titleFont = uiTitleFont;
         int W, H;
@@ -665,7 +669,7 @@ UIAction RunMenu(SDL_Window *window, SDL_Renderer *renderer,
     const SDL_Color white = {255, 255, 255, 255}, dim = {180, 195, 215, 255};
 
     bool running = true;
-    while (running) {
+    while (running && !PlumeTerm) {
         int n;
         SDL_LockMutex(hostLock);
         n = hostCount;

@@ -45,7 +45,8 @@ bool PlumeDiscoverHost(const char *wantIp, int timeoutSec, IHS_HostInfo *out);
 int PlumeDiscoverAll(int timeoutSec, IHS_HostInfo *out, int max);
 
 /* Control characters -> spaces, in place: a hostname comes off the wire and
- * --discover prints it into a tab-separated line somebody parses. */
+ * --discover prints it into a tab-separated line somebody parses. Every
+ * discovery callback applies it as it stores the host, so no sink sees raw bytes. */
 void PlumeCleanName(char *s);
 
 /* Ask the host for a stream. `result` (may be NULL) tells Unauthorized (= not
