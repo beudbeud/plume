@@ -33,7 +33,7 @@ static bool planeActive;                 /* video is on a DRM plane; skip the SD
 
 /* ---- Video decode (network thread writes, main thread reads) ---- */
 static AVCodecContext *vctx;
-static AVBufferRef *hwDeviceCtx;              /* HW decode device (Pi5 HEVC via V4L2-request/DRM) */
+static AVBufferRef *hwDeviceCtx;              /* HW decode device: Pi5 HEVC (V4L2-request/DRM), PC NVDEC/VAAPI/VDPAU */
 static enum AVPixelFormat hwPixFmt = AV_PIX_FMT_NONE;
 static struct SwsContext *sws;
 static AVPacket *vpkt;   /* reused per submit: the network thread is the hot path */
@@ -170,43 +170,57 @@ static int VideoStart(IHS_Session *session, const IHS_StreamVideoConfig *config,
      * decode thread, nothing DRM ever reaches the latch. */
     zeroCopyWanted = SDL_getenv("PLUME_NO_ZEROCOPY") == NULL;
 
-    /* Two shapes of hardware decode, and the Pi generations disagree on which:
+    /* Two shapes of hardware decode, tried in this order, then software:
      *
-     *  - hwaccel bound to a device context, discovered from the codec. That's the
-     *    Pi5's HEVC block (V4L2-request/DRM). It has no H264 block at all.
      *  - a whole standalone decoder, only findable by name. That's the VideoCore
      *    H264 block of the Pi3/Pi4, exposed as `h264_v4l2m2m`.
+     *  - hwaccel bound to a device context, discovered from the codec: the Pi5's
+     *    HEVC block (V4L2-request/DRM, it has no H264 block at all), and on a PC
+     *    whichever of NVDEC/VAAPI/VDPAU the GPU answers to. FFmpeg lists every
+     *    type it was built with, not the ones this machine has, so each is tried
+     *    until a device context actually opens.
      *
-     * Neither exists on a PC, where avcodec_find_decoder_by_name returns NULL and
-     * the hwaccel loop finds nothing, so we fall through to software. */
-    const AVCodec *hwCodec = NULL;
-    enum AVHWDeviceType hwType = AV_HWDEVICE_TYPE_NONE;
-    hwPixFmt = AV_PIX_FMT_NONE;
-    if (hevc) {
-        for (int i = 0;; i++) {
-            const AVCodecHWConfig *hw = avcodec_get_hw_config(sw, i);
-            if (!hw) break;
-            if (hw->methods & AV_CODEC_HW_CONFIG_METHOD_HW_DEVICE_CTX) {
-                hwCodec = sw;
-                hwType = hw->device_type;
-                hwPixFmt = hw->pix_fmt;
-                break;
-            }
+     * Opening the V4L2 decoder fails on a Pi5 (no H264 device node) and on any
+     * kernel without the driver, so the software fallback is the load-bearing
+     * path, not a nicety. */
+    typedef struct { const AVCodec *codec; enum AVHWDeviceType type; enum AVPixelFormat fmt; } DecoderTry;
+    DecoderTry tries[12];
+    int nTries = 0;
+    /* A hardware decoder that opens and then decodes badly can't be told apart
+     * from a good one at open time. Escape hatch, since the fallback is known to work. */
+    if (!SDL_getenv("PLUME_NO_HWDEC")) {
+        const AVCodec *v4l2 = hevc ? NULL : avcodec_find_decoder_by_name("h264_v4l2m2m");
+        if (v4l2) tries[nTries++] = (DecoderTry) {v4l2, AV_HWDEVICE_TYPE_NONE, AV_PIX_FMT_NONE};
+        const AVCodecHWConfig *hw;
+        for (int i = 0; nTries < (int) SDL_arraysize(tries) - 1 && (hw = avcodec_get_hw_config(sw, i)); i++) {
+            if (!(hw->methods & AV_CODEC_HW_CONFIG_METHOD_HW_DEVICE_CTX)) continue;
+            /* ponytail: a device context that opens proves the device, not that it
+             * decodes this codec. When it doesn't, FFmpeg quietly decodes in
+             * software inside the context we tuned for hardware (LOW_DELAY = no
+             * frame threads). So skip the two types known to open without a
+             * decoder behind them: Vulkan (any GPU, video extensions or not) and
+             * DRM for H264 (the Pi5's card opens, its H264 block doesn't exist).
+             * Anything else that misfires logs "hw pixel format unavailable";
+             * reopening in software from GetHwFormat is the upgrade path. */
+            if (hw->device_type == AV_HWDEVICE_TYPE_VULKAN) continue;
+            if (!hevc && hw->device_type == AV_HWDEVICE_TYPE_DRM) continue;
+            tries[nTries++] = (DecoderTry) {sw, hw->device_type, hw->pix_fmt};
         }
-    } else {
-        hwCodec = avcodec_find_decoder_by_name("h264_v4l2m2m");
     }
-    /* A V4L2 decoder that opens and then decodes badly can't be told apart from a
-     * good one at open time. Escape hatch, since the fallback is known to work. */
-    if (SDL_getenv("PLUME_NO_HWDEC")) hwCodec = NULL;
+    const int swTry = nTries;
+    tries[nTries++] = (DecoderTry) {sw, AV_HWDEVICE_TYPE_NONE, AV_PIX_FMT_NONE};
 
-    /* Attempt 0: hardware (if available). Attempt 1: software fallback. Opening
-     * the V4L2 decoder fails on a Pi5 (no H264 device node) and on any kernel
-     * without the driver, so the fallback is the load-bearing path, not a nicety. */
-    for (int attempt = 0; attempt < 2; attempt++) {
-        bool useHw = attempt == 0 && hwCodec != NULL;
-        const AVCodec *codec = useHw ? hwCodec : sw;
+    for (int t = 0; t < nTries; t++) {
+        bool useHw = t != swTry;
+        const AVCodec *codec = tries[t].codec;
+        const char *how = !useHw ? "software" : "hardware";
+        hwPixFmt = tries[t].fmt;
+        if (tries[t].type != AV_HWDEVICE_TYPE_NONE) {
+            if (av_hwdevice_ctx_create(&hwDeviceCtx, tries[t].type, NULL, NULL, 0) != 0) continue;
+            how = av_hwdevice_get_type_name(tries[t].type);
+        }
         vctx = avcodec_alloc_context3(codec);
+        if (!vctx) { av_buffer_unref(&hwDeviceCtx); break; }
         /* h264_v4l2m2m sizes the driver's OUTPUT and CAPTURE queues at open time.
          * Left at zero it opens blind and has to renegotiate on the first packet,
          * which some kernels fail outright. Free for the software decoder, which
@@ -214,15 +228,9 @@ static int VideoStart(IHS_Session *session, const IHS_StreamVideoConfig *config,
         vctx->width = (int) config->width;
         vctx->height = (int) config->height;
         vctx->thread_count = 0; /* auto: one thread per core */
-        /* The hwaccel shape is the software decoder plus a device context:
-         * without the context this attempt IS software, so say so and tune for it. */
-        if (useHw && hwType != AV_HWDEVICE_TYPE_NONE) {
-            if (av_hwdevice_ctx_create(&hwDeviceCtx, hwType, NULL, NULL, 0) == 0) {
-                vctx->hw_device_ctx = av_buffer_ref(hwDeviceCtx);
-                vctx->get_format = GetHwFormat;
-            } else {
-                useHw = false;
-            }
+        if (hwDeviceCtx) {
+            vctx->hw_device_ctx = av_buffer_ref(hwDeviceCtx);
+            vctx->get_format = GetHwFormat;
         }
         if (useHw) {
             /* Hardware decode is single-frame-latency anyway; ask for it explicitly. */
@@ -238,12 +246,12 @@ static int VideoStart(IHS_Session *session, const IHS_StreamVideoConfig *config,
             vctx->thread_type = FF_THREAD_FRAME | FF_THREAD_SLICE;
         }
         if (avcodec_open2(vctx, codec, NULL) == 0) {
-            SDL_Log("video decoder: %s (%s)", codec->name, useHw ? "hardware" : "software");
+            SDL_Log("video decoder: %s (%s)", codec->name, how);
             SDL_snprintf(statsCodec, sizeof(statsCodec), "%s %s", codec->name, useHw ? "hw" : "sw");
             return 0;
         }
         avcodec_free_context(&vctx);
-        if (hwDeviceCtx) av_buffer_unref(&hwDeviceCtx);
+        av_buffer_unref(&hwDeviceCtx);
     }
     av_packet_free(&vpkt);
     av_frame_free(&vframe);
